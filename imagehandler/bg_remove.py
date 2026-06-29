@@ -6,6 +6,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageFilter
 
+from .bg_refine import refine_foreground_mask_against_background, zero_transparent_rgb
 from .debug import save_mask
 from .io import load_image, sidecar_path
 from .mask_ops import (
@@ -39,7 +40,7 @@ def remove_background(
     postprocess: bool = True,
     feather: float = 0.0,
 ) -> OperationReport:
-    image = load_image(input_path, "RGBA")
+    source_image = load_image(input_path, "RGBA")
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -47,21 +48,28 @@ def remove_background(
     warnings: list[str] = []
 
     if selected_backend == "rembg":
-        rgba, mask = _remove_with_rembg(image, model=model, alpha_matting=alpha_matting)
+        rgba, mask = _remove_with_rembg(source_image, model=model, alpha_matting=alpha_matting)
     elif selected_backend == "transparent":
-        rgba, mask = _remove_with_transparent_background(image)
+        rgba, mask = _remove_with_transparent_background(source_image)
     elif selected_backend == "classical":
-        mask = foreground_mask_from_background(image)
-        rgba = apply_mask_as_alpha(image, mask)
+        mask = foreground_mask_from_background(source_image)
+        rgba = apply_mask_as_alpha(source_image, mask)
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
     if postprocess:
-        mask = clean_mask(mask, open_size=3, close_size=5, fill_holes=True)
+        # For character/person cutouts, filling holes is wrong because spaces
+        # between arms, torso, hair strands, etc. are real background. The
+        # refinement step also removes near-white border-connected background
+        # and silhouette fringing left by model masks.
+        mask = clean_mask(mask, open_size=2, close_size=3, fill_holes=False)
+        mask = refine_foreground_mask_against_background(source_image, mask)
         rgba = apply_mask_as_alpha(rgba, mask)
 
     if feather > 0:
         rgba = _feather_alpha(rgba, radius=feather)
+
+    rgba = zero_transparent_rgb(rgba)
 
     metrics = mask_metrics(mask)
     if metrics["foreground_area_ratio"] < 0.005:
