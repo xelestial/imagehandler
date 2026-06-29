@@ -18,8 +18,17 @@ from .mask_ops import (
 )
 from .reports import OperationReport
 
+DEFAULT_REMBG_MODEL = "birefnet-general"
 
-@lru_cache(maxsize=8)
+
+def normalize_rembg_model(model: str | None) -> str:
+    text = (model or "").strip()
+    if not text or text.lower() in {"auto", "default", "none"}:
+        return DEFAULT_REMBG_MODEL
+    return text
+
+
+@lru_cache(maxsize=12)
 def _rembg_session(model: str | None):
     try:
         from rembg import new_session
@@ -27,7 +36,7 @@ def _rembg_session(model: str | None):
         raise RuntimeError(
             "rembg backend is not installed. Install with: pip install -e '.[bg]'"
         ) from exc
-    return new_session(model) if model else new_session()
+    return new_session(normalize_rembg_model(model))
 
 
 def remove_background(
@@ -39,16 +48,20 @@ def remove_background(
     mask_only: bool = False,
     postprocess: bool = True,
     feather: float = 0.0,
+    cleanup_mode: str = "safe",
 ) -> OperationReport:
     source_image = load_image(input_path, "RGBA")
     output = Path(output_path)
     output.parent.mkdir(parents=True, exist_ok=True)
 
     selected_backend = _select_backend(backend)
+    backend_label = selected_backend
     warnings: list[str] = []
 
     if selected_backend == "rembg":
-        rgba, mask = _remove_with_rembg(source_image, model=model, alpha_matting=alpha_matting)
+        rembg_model = normalize_rembg_model(model)
+        rgba, mask = _remove_with_rembg(source_image, model=rembg_model, alpha_matting=alpha_matting)
+        backend_label = f"rembg:{rembg_model}"
     elif selected_backend == "transparent":
         rgba, mask = _remove_with_transparent_background(source_image)
     elif selected_backend == "classical":
@@ -58,12 +71,10 @@ def remove_background(
         raise ValueError(f"Unknown backend: {backend}")
 
     if postprocess:
-        # For character/person cutouts, filling holes is wrong because spaces
-        # between arms, torso, hair strands, etc. are real background. The
-        # refinement step also removes near-white border-connected background
-        # and silhouette fringing left by model masks.
-        mask = clean_mask(mask, open_size=2, close_size=3, fill_holes=False)
-        mask = refine_foreground_mask_against_background(source_image, mask)
+        # Do not fill holes for character/person cutouts. Arm gaps, leg gaps,
+        # hair gaps, and negative space are valid background.
+        mask = clean_mask(mask, open_size=1, close_size=2, fill_holes=False)
+        mask = refine_foreground_mask_against_background(source_image, mask, mode=cleanup_mode)
         rgba = apply_mask_as_alpha(rgba, mask)
 
     if feather > 0:
@@ -95,7 +106,7 @@ def remove_background(
         ok=len(warnings) == 0,
         operation="remove-bg",
         source=str(input_path),
-        backend=selected_backend,
+        backend=backend_label,
         warnings=warnings,
         metrics=metrics,
         boxes=[bbox] if bbox else [],
