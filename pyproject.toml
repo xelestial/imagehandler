@@ -1,0 +1,14 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "imagehandler"
+version = "0.1.0"
+description = "CLI image preprocessing pipelines."
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = ["numpy", "pillow", "opencv-python", "scipy", "scikit-image", "typer", "rich", "pydantic"]
+
+[project.scripts]
+imagehandler = "imagehandler.cli:app"
