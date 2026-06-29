@@ -46,8 +46,8 @@ USAGE
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --check|--check-only) INSTALL=0; RUN_SETUP=0 ;;
-    --install) INSTALL=1 ;; # kept for backward compatibility; now default
-    --run-setup) RUN_SETUP=1 ;; # kept for backward compatibility; now default
+    --install) INSTALL=1 ;; # backward compatible; default
+    --run-setup) RUN_SETUP=1 ;; # backward compatible; default
     --no-setup) RUN_SETUP=0 ;;
     --fix-owner) FIX_OWNER=1 ;;
     --python) PYTHON_VERSION="$2"; shift ;;

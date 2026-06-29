@@ -1,0 +1,25 @@
+{
+  "operation": "split-sheet",
+  "source": "test_sheet.png",
+  "target": "out_retry",
+  "selected_attempt": "strategy:1",
+  "selected_verdict": "PASS",
+  "selected_score": 97.6,
+  "accepted": true,
+  "attempts": [
+    {
+      "name": "strategy:1",
+      "verdict": "PASS",
+      "score": 97.6,
+      "accepted": true,
+      "target": "/tmp/imagehandler_split_retry_cdx5otsb/attempt_01",
+      "warnings": [],
+      "failures": [],
+      "details": {
+        "threshold": 28.0,
+        "min_area": 1000,
+        "merge_distance": 24
+      }
+    }
+  ]
+}

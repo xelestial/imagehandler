@@ -1,0 +1,48 @@
+{
+  "ok": true,
+  "operation": "split-sheet",
+  "source": "test_sheet.png",
+  "backend": null,
+  "mode": "component",
+  "warnings": [],
+  "metrics": {
+    "views_requested": 4,
+    "views_detected": 4,
+    "image_width": 800,
+    "image_height": 200,
+    "min_area": 1000,
+    "merge_distance": 24
+  },
+  "boxes": [
+    [
+      50,
+      30,
+      151,
+      191
+    ],
+    [
+      250,
+      30,
+      351,
+      191
+    ],
+    [
+      450,
+      30,
+      551,
+      191
+    ],
+    [
+      650,
+      30,
+      751,
+      191
+    ]
+  ],
+  "outputs": [
+    "out_retry/view_01.png",
+    "out_retry/view_02.png",
+    "out_retry/view_03.png",
+    "out_retry/view_04.png"
+  ]
+}

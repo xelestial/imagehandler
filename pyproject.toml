@@ -5,10 +5,46 @@ build-backend = "hatchling.build"
 [project]
 name = "imagehandler"
 version = "0.1.0"
-description = "CLI image preprocessing pipelines."
+description = "CLI pipelines for background removal, character sheet splitting, and whitespace/object extraction."
 readme = "README.md"
 requires-python = ">=3.11,<3.14"
-dependencies = ["numpy", "pillow", "opencv-python", "scipy", "scikit-image", "typer", "rich", "pydantic"]
+license = { text = "MIT" }
+authors = [{ name = "xelestial" }]
+dependencies = [
+  "numpy>=1.26",
+  "pillow>=10.0",
+  "opencv-python>=4.8",
+  "scipy>=1.11",
+  "scikit-image>=0.22",
+  "typer>=0.12",
+  "rich>=13.7",
+  "pydantic>=2.7"
+]
+
+[project.optional-dependencies]
+bg = [
+  "rembg[cpu]>=2.0.0"
+]
+bg-gpu = [
+  "rembg[gpu]>=2.0.0"
+]
+transparent = [
+  "transparent-background>=1.3.4"
+]
+matting = [
+  "pymatting>=1.1"
+]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.5"
+]
 
 [project.scripts]
 imagehandler = "imagehandler.cli:app"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
