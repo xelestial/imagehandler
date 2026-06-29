@@ -20,10 +20,8 @@ class JobPaths:
     job_root: Path
     input_root: Path
     output_root: Path
-    complete_root: Path
     failed_root: Path
     reports_root: Path
-    tmp_root: Path
 
     @property
     def quality_root(self) -> Path:
@@ -32,6 +30,10 @@ class JobPaths:
     @property
     def logs_root(self) -> Path:
         return self.reports_root
+
+    @property
+    def tmp_root(self) -> Path:
+        return self.job_root / "tmp"
 
 
 def sanitize_job_name(name: str) -> str:
@@ -47,10 +49,9 @@ def task_dir_name(task_group: str) -> str:
 def ensure_workspace_root(workspace_root: str | Path) -> Path:
     root = Path(workspace_root)
     for task in ["bg", "sheets", "items"]:
-        for rel in ["input", "output", "complete", "failed"]:
+        for rel in ["input", "jobs", "failed"]:
             (root / task / rel).mkdir(parents=True, exist_ok=True)
     (root / "reports").mkdir(parents=True, exist_ok=True)
-    (root / "tmp").mkdir(parents=True, exist_ok=True)
     return root
 
 
@@ -58,13 +59,13 @@ def derive_job_name_from_input(input_path: str | Path) -> str:
     return sanitize_job_name(Path(input_path).stem)
 
 
-def _unique_job_dir(output_root: Path, base_name: str) -> Path:
+def _unique_job_dir(jobs_root: Path, base_name: str) -> Path:
     base = sanitize_job_name(base_name)
-    candidate = output_root / base
+    candidate = jobs_root / base
     if not candidate.exists():
         return candidate
     suffix = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return output_root / f"{base}_{suffix}"
+    return jobs_root / f"{base}_{suffix}"
 
 
 def create_job_paths(
@@ -76,31 +77,26 @@ def create_job_paths(
     root = ensure_workspace_root(workspace_root)
     task = task_dir_name(task_group)
     task_root = root / task
-
-    input_root = task_root / "input"
-    output_root = task_root / "output"
-    complete_root = task_root / "complete"
+    jobs_root = task_root / "jobs"
     failed_root = task_root / "failed"
-    reports_root = root / "reports"
-    tmp_root = root / "tmp" / task
-
-    for folder in [input_root, output_root, complete_root, failed_root, reports_root, tmp_root]:
-        folder.mkdir(parents=True, exist_ok=True)
 
     base_name = sanitize_job_name(job_name) if job_name else derive_job_name_from_input(input_path or "job")
-    job_root = _unique_job_dir(output_root, base_name)
-    job_root.mkdir(parents=True, exist_ok=True)
+    job_root = _unique_job_dir(jobs_root, base_name)
+    input_root = job_root / "input"
+    output_root = job_root / "output"
+    reports_root = job_root / "reports"
+
+    for folder in [input_root, output_root]:
+        folder.mkdir(parents=True, exist_ok=True)
 
     return JobPaths(
         workspace_root=root,
         task_root=task_root,
         job_root=job_root,
         input_root=input_root,
-        output_root=job_root,
-        complete_root=complete_root,
+        output_root=output_root,
         failed_root=failed_root,
         reports_root=reports_root,
-        tmp_root=tmp_root,
     )
 
 
@@ -118,7 +114,9 @@ def resolve_output_for_task(
     stem = Path(input_path).stem
 
     if task_group == "quality":
-        return workspace_root / "reports" / f"{stem}.judge.json", None
+        reports_root = workspace_root / "reports"
+        reports_root.mkdir(parents=True, exist_ok=True)
+        return reports_root / f"{stem}.judge.json", None
 
     job_paths = create_job_paths(
         workspace_root=workspace_root,
