@@ -12,7 +12,6 @@ from .io import load_image, sidecar_path
 from .mask_ops import (
     apply_mask_as_alpha,
     bbox_from_mask,
-    clean_mask,
     foreground_mask_from_background,
     mask_metrics,
 )
@@ -60,27 +59,41 @@ def remove_background(
 
     if selected_backend == "rembg":
         rembg_model = normalize_rembg_model(model)
-        rgba, mask = _remove_with_rembg(source_image, model=rembg_model, alpha_matting=alpha_matting)
+        rgba, soft_alpha = _remove_with_rembg(source_image, model=rembg_model, alpha_matting=alpha_matting)
         backend_label = f"rembg:{rembg_model}"
     elif selected_backend == "transparent":
-        rgba, mask = _remove_with_transparent_background(source_image)
+        rgba, soft_alpha = _remove_with_transparent_background(source_image)
     elif selected_backend == "classical":
-        mask = foreground_mask_from_background(source_image)
-        rgba = apply_mask_as_alpha(source_image, mask)
+        support_mask = foreground_mask_from_background(source_image)
+        soft_alpha = (support_mask.astype(np.uint8) * 255)
+        rgba = apply_mask_as_alpha(source_image, support_mask)
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
+    support_mask = soft_alpha > 8
+
     if postprocess:
-        # Do not fill holes for character/person cutouts. Arm gaps, leg gaps,
-        # hair gaps, and negative space are valid background.
-        mask = clean_mask(mask, open_size=1, close_size=2, fill_holes=False)
-        mask = refine_foreground_mask_against_background(source_image, mask, mode=cleanup_mode)
-        rgba = apply_mask_as_alpha(rgba, mask)
+        # Preserve the model's soft alpha. The support mask is only allowed to
+        # zero out pixels that are definitely outside the foreground. Never
+        # replace the alpha channel with a binary mask, because that creates
+        # jagged edges and destroys hair/skin antialiasing.
+        refined_support = refine_foreground_mask_against_background(
+            source_image,
+            support_mask,
+            mode=cleanup_mode,
+        )
+        soft_alpha = _clip_soft_alpha_to_support(soft_alpha, refined_support)
+        support_mask = soft_alpha > 8
+        rgba = _apply_soft_alpha(rgba, soft_alpha)
 
     if feather > 0:
         rgba = _feather_alpha(rgba, radius=feather)
+        soft_alpha = _extract_alpha(rgba)
+        support_mask = soft_alpha > 8
 
     rgba = zero_transparent_rgb(rgba)
+    soft_alpha = _extract_alpha(rgba)
+    mask = soft_alpha > 8
 
     metrics = mask_metrics(mask)
     if metrics["foreground_area_ratio"] < 0.005:
@@ -136,6 +149,22 @@ def _select_backend(backend: str) -> str:
     return "classical"
 
 
+def _extract_alpha(image: Image.Image) -> np.ndarray:
+    return np.asarray(image.convert("RGBA"))[:, :, 3].copy()
+
+
+def _apply_soft_alpha(image: Image.Image, alpha: np.ndarray) -> Image.Image:
+    rgba = np.array(image.convert("RGBA"), copy=True)
+    rgba[:, :, 3] = np.clip(alpha, 0, 255).astype(np.uint8)
+    return Image.fromarray(rgba, mode="RGBA")
+
+
+def _clip_soft_alpha_to_support(alpha: np.ndarray, support: np.ndarray) -> np.ndarray:
+    out = np.array(alpha, copy=True)
+    out[~support.astype(bool)] = 0
+    return out
+
+
 def _remove_with_rembg(
     image: Image.Image,
     model: str | None,
@@ -148,8 +177,7 @@ def _remove_with_rembg(
     if not isinstance(out, Image.Image):
         out = Image.open(out).convert("RGBA")
     out = out.convert("RGBA")
-    alpha = np.asarray(out)[:, :, 3]
-    return out, alpha > 8
+    return out, _extract_alpha(out)
 
 
 def _remove_with_transparent_background(image: Image.Image) -> tuple[Image.Image, np.ndarray]:
@@ -162,8 +190,7 @@ def _remove_with_transparent_background(image: Image.Image) -> tuple[Image.Image
 
     remover = Remover()
     out = remover.process(image.convert("RGB"), type="rgba").convert("RGBA")
-    alpha = np.asarray(out)[:, :, 3]
-    return out, alpha > 8
+    return out, _extract_alpha(out)
 
 
 def _feather_alpha(image: Image.Image, radius: float) -> Image.Image:
