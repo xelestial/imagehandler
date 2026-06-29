@@ -95,15 +95,15 @@ def _choose(title: str, options: list[tuple[str, str]]) -> str:
         typer.echo("Selection out of range.")
 
 
-def _task_input(task: str) -> Path:
+def _task_paths(task: str) -> tuple[Path, Path, Path]:
     root = _ensure_workspace()
-    if task == "bg":
-        return root / "bg" / "input"
-    if task == "sheet":
-        return root / "sheets" / "input"
-    if task == "items":
-        return root / "items" / "input"
-    return root / "quality" / "input"
+    task_dir = {"bg": "bg", "sheet": "sheets", "items": "items", "quality": "quality"}[task]
+    task_root = root / task_dir
+    return task_root / "input", task_root / "complete", task_root / "jobs"
+
+
+def _task_input(task: str) -> Path:
+    return _task_paths(task)[0]
 
 
 def _list_images(path: Path, recursive: bool = True) -> list[Path]:
@@ -115,10 +115,26 @@ def _list_images(path: Path, recursive: bool = True) -> list[Path]:
     return sorted([p for p in path.glob(pattern) if p.is_file() and p.suffix.lower() in IMAGE_EXTS and "complete" not in p.parts])
 
 
+def _show_task_help(task: str, title: str) -> list[Path]:
+    input_dir, complete_dir, jobs_dir = _task_paths(task)
+    pending = _list_images(input_dir, recursive=True)
+    typer.echo(f"\n{title}")
+    typer.echo(f"  Put source files here : {input_dir}")
+    typer.echo(f"  Completed files go to : {complete_dir}")
+    typer.echo(f"  Results are under     : {jobs_dir}/<job_name>/output")
+    typer.echo(f"  Pending image count   : {len(pending)}")
+    return pending
+
+
+def _warn_no_images(folder: Path) -> None:
+    typer.echo(f"\n[WARN] No image files found in: {folder}")
+    typer.echo(f"Put .png/.jpg/.webp/etc files into this folder, then run again: {folder}")
+
+
 def _one_image_or_warn(folder: Path) -> Path | None:
     files = _list_images(folder, recursive=True)
     if not files:
-        typer.echo(f"\n[WARN] No image files found in: {folder}")
+        _warn_no_images(folder)
         return None
     if len(files) > 1:
         typer.echo(f"Using first image: {files[0]} ({len(files)} found)")
@@ -127,20 +143,23 @@ def _one_image_or_warn(folder: Path) -> Path | None:
 
 def _show_hint() -> None:
     root = _ensure_workspace()
-    typer.echo("\nTask-first workspace:")
-    typer.echo(f"  BG input      : {root / 'bg' / 'input'}")
-    typer.echo(f"  Sheets input  : {root / 'sheets' / 'input'}")
-    typer.echo(f"  Items input   : {root / 'items' / 'input'}")
-    typer.echo(f"  Results       : {root}/<task>/jobs/<job>/output")
-    typer.echo(f"  Complete      : {root}/<task>/complete")
+    typer.echo("\nTask-first workspace. Put files into the task input folder before Quick run:")
+    typer.echo(f"  1. BG     input: {root / 'bg' / 'input'}")
+    typer.echo(f"  2. Sheets input: {root / 'sheets' / 'input'}")
+    typer.echo(f"  3. Items  input: {root / 'items' / 'input'}")
+    typer.echo(f"  Results        : {root}/<task>/jobs/<job>/output")
+    typer.echo(f"  Complete       : {root}/<task>/complete")
 
 
 def _show_config(config: dict) -> None:
+    bg_input, _, _ = _task_paths("bg")
+    sheet_input, _, _ = _task_paths("sheet")
+    items_input, _, _ = _task_paths("items")
     typer.echo("\nCurrent config")
     typer.echo(f"  Profile: {config.get('profile')}")
-    typer.echo(f"  BG    : {'single' if config['bg']['single'] else 'batch'}, retry={config['bg']['retry_on_fail']}")
-    typer.echo(f"  Sheet : {'single' if config['sheet']['single'] else 'batch'}, views={config['sheet']['views']}, retry={config['sheet']['retry_on_fail']}")
-    typer.echo(f"  Items : {'single' if config['items']['single'] else 'batch'}, retry={config['items']['retry_on_fail']}")
+    typer.echo(f"  BG    : {'single' if config['bg']['single'] else 'batch'}, retry={config['bg']['retry_on_fail']}, input={bg_input}")
+    typer.echo(f"  Sheet : {'single' if config['sheet']['single'] else 'batch'}, views={config['sheet']['views']}, retry={config['sheet']['retry_on_fail']}, input={sheet_input}")
+    typer.echo(f"  Items : {'single' if config['items']['single'] else 'batch'}, retry={config['items']['retry_on_fail']}, input={items_input}")
 
 
 def _config_menu(config: dict) -> dict:
@@ -166,10 +185,12 @@ def _config_menu(config: dict) -> dict:
 def _quick_bg(config: dict) -> None:
     opts = config["bg"]
     folder = _task_input("bg")
+    pending = _show_task_help("bg", "BG / background removal")
+    if not pending:
+        _warn_no_images(folder)
+        return
     if opts["single"]:
-        path = _one_image_or_warn(folder)
-        if path is None:
-            return
+        path = pending[0]
         remove_cmd(path, None, _workspace_root(), None, opts["backend"], opts.get("model"), opts["alpha_matting"], False, False, 0.0, opts["retry_on_fail"], "PASS", 85.0)
     else:
         batch_remove_cmd(folder, None, _workspace_root(), opts["recursive"], None, opts["backend"], opts.get("model"), opts["alpha_matting"], opts["retry_on_fail"], opts["continue_on_error"])
@@ -178,11 +199,12 @@ def _quick_bg(config: dict) -> None:
 def _quick_sheet(config: dict) -> None:
     opts = config["sheet"]
     folder = _task_input("sheet")
+    pending = _show_task_help("sheet", "Sheets / character sheet splitting")
+    if not pending:
+        _warn_no_images(folder)
+        return
     if opts["single"]:
-        path = _one_image_or_warn(folder)
-        if path is None:
-            return
-        split_cmd(path, None, _workspace_root(), None, opts["views"], opts["padding"], opts["min_area"], opts["merge_distance"], opts.get("normalize_size"), opts["threshold"], opts["debug"], opts["retry_on_fail"], opts["accept_verdict"], opts["min_score"])
+        split_cmd(pending[0], None, _workspace_root(), None, opts["views"], opts["padding"], opts["min_area"], opts["merge_distance"], opts.get("normalize_size"), opts["threshold"], opts["debug"], opts["retry_on_fail"], opts["accept_verdict"], opts["min_score"])
     else:
         batch_split_cmd(folder, None, _workspace_root(), opts["recursive"], None, opts["views"], opts["padding"], opts["min_area"], opts["merge_distance"], opts.get("normalize_size"), opts["threshold"], opts["debug"], opts["retry_on_fail"], opts["continue_on_error"])
 
@@ -190,11 +212,12 @@ def _quick_sheet(config: dict) -> None:
 def _quick_items(config: dict) -> None:
     opts = config["items"]
     folder = _task_input("items")
+    pending = _show_task_help("items", "Items / equipment-item extraction")
+    if not pending:
+        _warn_no_images(folder)
+        return
     if opts["single"]:
-        path = _one_image_or_warn(folder)
-        if path is None:
-            return
-        extract_cmd(path, None, _workspace_root(), None, opts["padding"], opts["min_area"], opts["merge_distance"], opts["square_canvas"], opts.get("normalize_size"), opts["transparent_bg"], opts["threshold"], opts["debug"], opts["retry_on_fail"], opts["accept_verdict"], opts["min_score"], opts["min_count"])
+        extract_cmd(pending[0], None, _workspace_root(), None, opts["padding"], opts["min_area"], opts["merge_distance"], opts["square_canvas"], opts.get("normalize_size"), opts["transparent_bg"], opts["threshold"], opts["debug"], opts["retry_on_fail"], opts["accept_verdict"], opts["min_score"], opts["min_count"])
     else:
         batch_extract_cmd(folder, None, _workspace_root(), opts["recursive"], None, opts["padding"], opts["min_area"], opts["merge_distance"], opts["square_canvas"], opts.get("normalize_size"), opts["transparent_bg"], opts["threshold"], opts["debug"], opts["retry_on_fail"], opts["min_count"], opts["continue_on_error"])
 
@@ -202,18 +225,32 @@ def _quick_items(config: dict) -> None:
 def _quick_quality(config: dict) -> None:
     opts = config["quality"]
     target = _workspace_root() / "quality" / "input"
+    pending = _show_task_help("quality", "Quality judge")
+    if not pending:
+        _warn_no_images(target)
+        return
     if opts["single"]:
-        path = _one_image_or_warn(target)
-        if path is None:
-            return
-        judge_cmd(path, opts["task"], opts.get("expected_count"), opts["min_count"], None, _workspace_root(), None, opts["debug"], opts.get("alpha_required"))
+        judge_cmd(pending[0], opts["task"], opts.get("expected_count"), opts["min_count"], None, _workspace_root(), None, opts["debug"], opts.get("alpha_required"))
     else:
         batch_judge_cmd(target, None, _workspace_root(), opts["recursive"], None, opts["task"], opts.get("alpha_required"), opts["continue_on_error"])
 
 
 def _quick_menu(config: dict) -> None:
     _show_config(config)
-    choice = _choose("Quick run", [("bg", "BG"), ("sheet", "Sheets"), ("items", "Items"), ("quality", "Quality"), ("back", "Back")])
+    bg_input, _, _ = _task_paths("bg")
+    sheet_input, _, _ = _task_paths("sheet")
+    items_input, _, _ = _task_paths("items")
+    quality_input, _, _ = _task_paths("quality")
+    choice = _choose(
+        "Quick run - choose task after placing files in the shown input folder",
+        [
+            ("bg", f"BG / background removal          -> put files in {bg_input}"),
+            ("sheet", f"Sheets / character split        -> put files in {sheet_input}"),
+            ("items", f"Items / equipment extraction    -> put files in {items_input}"),
+            ("quality", f"Quality judge                   -> put files in {quality_input}"),
+            ("back", "Back"),
+        ],
+    )
     if choice == "bg":
         _quick_bg(config)
     elif choice == "sheet":
