@@ -66,20 +66,31 @@ def relative_output_dir(input_file: Path, input_root: Path, output_root: Path) -
     return output_root / rel
 
 
+def complete_root_for_input_root(input_root: Path) -> Path:
+    if input_root.name == "input":
+        return input_root.parent / "complete"
+    return input_root / "complete"
+
+
 def move_input_to_complete(input_file: Path, input_root: Path) -> Path | None:
     input_file = Path(input_file)
     input_root = Path(input_root)
+
     if not input_file.exists() or input_root.is_file():
         return None
-    if _is_under_complete(input_file, input_root):
-        return None
+
     try:
         rel = input_file.relative_to(input_root)
     except ValueError:
         return None
-    complete_root = input_root / 'complete'
+
+    if "complete" in rel.parts:
+        return None
+
+    complete_root = complete_root_for_input_root(input_root)
     dst = complete_root / rel
     dst.parent.mkdir(parents=True, exist_ok=True)
+
     if dst.exists():
         stem = dst.stem
         suffix = dst.suffix
@@ -90,5 +101,6 @@ def move_input_to_complete(input_file: Path, input_root: Path) -> Path | None:
                 dst = candidate
                 break
             counter += 1
+
     shutil.move(str(input_file), str(dst))
     return dst
