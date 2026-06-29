@@ -6,7 +6,12 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageFilter
 
-from .bg_refine import refine_foreground_mask_against_background, zero_transparent_rgb
+from .bg_refine import (
+    decontaminate_edge_rgb,
+    refine_foreground_mask_against_background,
+    smooth_alpha_edges,
+    zero_transparent_rgb,
+)
 from .debug import save_mask
 from .io import load_image, sidecar_path
 from .mask_ops import (
@@ -75,16 +80,18 @@ def remove_background(
     if postprocess:
         # Preserve the model's soft alpha. The support mask is only allowed to
         # zero out pixels that are definitely outside the foreground. Never
-        # replace the alpha channel with a binary mask, because that creates
-        # jagged edges and destroys hair/skin antialiasing.
+        # replace the alpha channel with a binary mask.
         refined_support = refine_foreground_mask_against_background(
             source_image,
             support_mask,
             mode=cleanup_mode,
         )
         soft_alpha = _clip_soft_alpha_to_support(soft_alpha, refined_support)
-        support_mask = soft_alpha > 8
+        soft_alpha = smooth_alpha_edges(soft_alpha, radius=0.65)
         rgba = _apply_soft_alpha(rgba, soft_alpha)
+        rgba = decontaminate_edge_rgb(rgba, solid_alpha=250, width=3.0)
+        soft_alpha = _extract_alpha(rgba)
+        support_mask = soft_alpha > 8
 
     if feather > 0:
         rgba = _feather_alpha(rgba, radius=feather)
@@ -107,11 +114,11 @@ def remove_background(
     report_path = output.with_name(f"{output.stem}.report.json")
 
     if mask_only:
-        save_mask(mask, output)
+        _save_alpha_matte(soft_alpha, output)
         outputs = [str(output)]
     else:
         rgba.save(output)
-        save_mask(mask, mask_path)
+        _save_alpha_matte(soft_alpha, mask_path)
         outputs = [str(output), str(mask_path)]
 
     bbox = bbox_from_mask(mask)
@@ -163,6 +170,11 @@ def _clip_soft_alpha_to_support(alpha: np.ndarray, support: np.ndarray) -> np.nd
     out = np.array(alpha, copy=True)
     out[~support.astype(bool)] = 0
     return out
+
+
+def _save_alpha_matte(alpha: np.ndarray, path: str | Path) -> None:
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(np.clip(alpha, 0, 255).astype(np.uint8), mode="L").save(path)
 
 
 def _remove_with_rembg(
