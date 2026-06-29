@@ -40,6 +40,7 @@ Examples:
   ./dependency.sh --check-only
   ./dependency.sh --no-setup
   ./dependency.sh --setup-arg --workspace --setup-arg ./workspace
+  ./dependency.sh --setup-arg --skip-smoke
 USAGE
 }
 
@@ -50,8 +51,16 @@ while [[ $# -gt 0 ]]; do
     --run-setup) RUN_SETUP=1 ;; # backward compatible; default
     --no-setup) RUN_SETUP=0 ;;
     --fix-owner) FIX_OWNER=1 ;;
-    --python) PYTHON_VERSION="$2"; shift ;;
-    --setup-arg) SETUP_ARGS+=("$2"); shift ;;
+    --python)
+      [[ $# -ge 2 ]] || fail "--python requires a value"
+      PYTHON_VERSION="$2"
+      shift
+      ;;
+    --setup-arg)
+      [[ $# -ge 2 ]] || fail "--setup-arg requires a value"
+      SETUP_ARGS+=("$2")
+      shift
+      ;;
     -h|--help) usage; exit 0 ;;
     *) fail "Unknown option: $1" ;;
   esac
@@ -145,7 +154,15 @@ PY
 
 if [[ "$RUN_SETUP" -eq 1 ]]; then
   log "Running setup.sh"
-  PYTHON_BIN="$PY" "$ROOT_DIR/setup.sh" "${SETUP_ARGS[@]}"
+
+  # macOS ships Bash 3.2. With `set -u`, expanding an empty array as
+  # "${SETUP_ARGS[@]}" can raise "unbound variable". Keep the empty-arg path
+  # separate.
+  if [[ "${#SETUP_ARGS[@]}" -gt 0 ]]; then
+    PYTHON_BIN="$PY" "$ROOT_DIR/setup.sh" "${SETUP_ARGS[@]}"
+  else
+    PYTHON_BIN="$PY" "$ROOT_DIR/setup.sh"
+  fi
 else
   cat <<EOF
 
