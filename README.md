@@ -7,6 +7,8 @@ Features:
 - split four-view character sheets without assuming equal-width columns
 - extract equipment, item, and icon sprites from sheets
 - judge processed results with PASS/WARN/FAIL quality reports
+- retry alternate backends/strategies when quality is poor
+- process many image files from a folder
 - write debug overlays and JSON reports
 
 ## Setup
@@ -22,6 +24,40 @@ Optional:
 ./setup.sh --gpu
 ./setup.sh --transparent --matting
 ./setup.sh --all
+```
+
+## Menu-style CLI groups
+
+Preferred grouped commands:
+
+```bash
+imagehandler bg remove input.png -o output.png
+imagehandler bg batch-remove ./inputs -o ./outputs --recursive --retry-on-fail
+
+imagehandler sheet split character_sheet.png -o out --views 4
+imagehandler sheet batch-split ./sheets -o ./split_out --recursive --retry-on-fail
+
+imagehandler items extract equipment_sheet.png -o out --min-count 4 --retry-on-fail
+imagehandler items batch-extract ./equipment_sheets -o ./items_out --recursive
+
+imagehandler quality judge output.png --task remove-bg
+imagehandler quality batch-judge ./outputs -o ./judge_reports --recursive
+```
+
+Legacy aliases still work:
+
+```bash
+imagehandler remove-bg input.png -o output.png
+imagehandler split-sheet sheet.png -o out
+imagehandler extract-items sheet.png -o out
+imagehandler judge output.png
+```
+
+## Package folders
+
+```text
+imagehandler/commands/   # menu item command groups
+imagehandler/batch/      # multi-file discovery and output mapping helpers
 ```
 
 ## Judge processed outputs
