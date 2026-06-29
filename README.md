@@ -22,3 +22,21 @@ Optional:
 ./setup.sh --transparent --matting
 ./setup.sh --all
 ```
+
+## macOS
+
+Use the default CPU backend on macOS:
+
+```bash
+chmod +x setup.sh
+./setup.sh
+```
+
+If multiple Python versions exist or the system Python is too old, run:
+
+```bash
+brew install python@3.12
+PYTHON_BIN=python3.12 ./setup.sh
+```
+
+`--gpu` is for NVIDIA/CUDA systems. On normal macOS, `setup.sh --gpu` automatically falls back to CPU.
