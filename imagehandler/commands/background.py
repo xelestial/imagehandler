@@ -8,8 +8,8 @@ import typer
 from imagehandler.batch import (
     BatchResult,
     iter_image_files,
-    move_input_to_complete,
     move_input_to_failed,
+    move_input_to_job_input,
     relative_output_file,
 )
 from imagehandler.bg_remove import remove_background
@@ -24,9 +24,9 @@ app = typer.Typer(no_args_is_help=True, help="Background removal menu.")
 @app.command("remove")
 def remove_cmd(
     input_path: Path = typer.Argument(..., exists=True, readable=True),
-    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Output PNG path. If omitted, use workspace/bg/output/<job>/.") ,
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Output PNG path. If omitted, use workspace/bg/jobs/<job>/output/."),
     workspace: Optional[Path] = typer.Option(None, help="Workspace root used when --output is omitted. Default: ./workspace"),
-    job: Optional[str] = typer.Option(None, help="Optional output job folder name. If omitted, use the input filename."),
+    job: Optional[str] = typer.Option(None, help="Optional job folder name. If omitted, use the input filename."),
     backend: str = typer.Option("auto", help="auto, rembg, transparent, classical"),
     model: Optional[str] = typer.Option(None, help="rembg model name."),
     alpha_matting: bool = typer.Option(False, help="Enable rembg alpha matting."),
@@ -72,7 +72,7 @@ def remove_cmd(
 @app.command("batch-remove")
 def batch_remove_cmd(
     input_path: Path = typer.Argument(..., exists=True, readable=True, help="Image file or input directory."),
-    output_dir: Optional[Path] = typer.Option(None, "--output", "-o", help="Output directory. If omitted, use workspace/bg/output/<job>/ per file."),
+    output_dir: Optional[Path] = typer.Option(None, "--output", "-o", help="Output directory. If omitted, use workspace/bg/jobs/<job>/output/ per file."),
     workspace: Optional[Path] = typer.Option(None, help="Workspace root used when --output is omitted. Default: ./workspace"),
     recursive: bool = typer.Option(False, help="Search recursively."),
     pattern: Optional[str] = typer.Option(None, help="Glob pattern. Example: '**/*.png'"),
@@ -89,6 +89,7 @@ def batch_remove_cmd(
     if output_dir is not None:
         output_dir.mkdir(parents=True, exist_ok=True)
     for src in files:
+        job_paths = None
         if output_dir is None:
             dst, job_paths = resolve_output_for_task("bg", src, None, workspace, None)
             output_jobs.append(str(job_paths.output_root) if job_paths else str(dst.parent))
@@ -102,9 +103,10 @@ def batch_remove_cmd(
                 remove_background(src, dst, backend=backend, model=model, alpha_matting=alpha_matting)
             result.succeeded += 1
             result.outputs.append(str(dst))
-            moved = move_input_to_complete(src, root)
-            if moved is not None:
-                result.moved_to_complete.append(str(moved))
+            if job_paths is not None:
+                moved = move_input_to_job_input(src, root, job_paths.input_root)
+                if moved is not None:
+                    result.moved_to_job_input.append(str(moved))
         except Exception as exc:
             result.failed += 1
             result.errors.append(f"{src}: {exc}")
