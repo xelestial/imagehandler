@@ -55,33 +55,31 @@ def refine_foreground_mask_against_background(
     bg_threshold: float = 24.0,
     fringe_width: int = 1,
 ) -> np.ndarray:
-    """Refine a foreground mask without assuming a white background.
+    """Refine a support mask without assuming a white background.
 
     Modes:
-      safe       : morphology only; does not delete pixels by color.
+      safe/off   : return support mask unchanged. This preserves the model's
+                   soft alpha edge in bg_remove.py.
       aggressive : additionally removes only border-connected, low-chroma light
                    pixels. Use only for studio white/off-white backgrounds.
-      off        : return mask unchanged.
 
-    The default is intentionally conservative because character skin, blonde
-    hair, light clothing, and antialiased edges can be close to a white or gray
-    background. Background cleanup by color is only safe when explicitly enabled.
+    The default is deliberately conservative. If this function deletes pixels in
+    safe mode, the final alpha edge becomes jagged again, so safe mode must not
+    run morphology or color-based deletion.
     """
     mode = (mode or "safe").lower().strip()
     m = mask.astype(bool)
 
-    if mode in {"off", "none", "false", "0"}:
+    if mode in {"off", "none", "false", "0", "safe", "conservative"}:
         return m
 
-    # Never fill holes for character cutouts. Spaces between arms, legs, hair,
-    # and torso are valid background and should remain removable.
-    m = clean_mask(m, open_size=1, close_size=2, fill_holes=False)
-
     if mode not in {"aggressive", "white", "white-bg", "white_bg"}:
-        return m.astype(bool)
+        return m
 
-    # Aggressive mode is restricted to low-chroma light pixels to avoid deleting
-    # bright skin or colored foreground edges. It is deliberately not the default.
+    # Aggressive mode is intentionally opt-in. It targets only low-chroma light
+    # pixels connected to the canvas border, reducing white halo on white studio
+    # backgrounds without treating all background colors as removable.
+    m = clean_mask(m, open_size=1, close_size=1, fill_holes=False)
     bg_like = _background_like_mask(image, threshold=bg_threshold)
     light_neutral = _low_chroma_light_mask(image)
     removable_bg = bg_like & light_neutral
@@ -93,7 +91,6 @@ def refine_foreground_mask_against_background(
         boundary = _inner_boundary(m, width=fringe_width)
         m = m & ~(boundary & removable_bg)
 
-    m = clean_mask(m, open_size=1, close_size=1, fill_holes=False)
     return m.astype(bool)
 
 
