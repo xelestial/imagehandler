@@ -1,0 +1,42 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local setup outputs
+.python-bin
+.imagehandler-env
+.setup_smoke/
+
+# ImageHandler runtime workspace
+workspace/
+
+# Local generated outputs / temporary runs
+out/
+out_*/
+*_out/
+*.judge.json
+*.report.json
+*.fallback.json
+*.mask.png
+
+# OS / editor files
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Packaging/build cache
+build/
+*.egg-info/
+
+# Logs
+*.log
