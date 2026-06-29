@@ -7,12 +7,20 @@ from PIL import Image
 from .mask_ops import clean_mask, estimate_background_rgb, pil_to_rgba_array
 
 
-def _background_like_mask(image: Image.Image, threshold: float = 34.0, border: int = 32) -> np.ndarray:
+def _background_like_mask(image: Image.Image, threshold: float = 24.0, border: int = 32) -> np.ndarray:
     rgba = pil_to_rgba_array(image)
     bg = np.array(estimate_background_rgb(rgba, border=border), dtype=np.float32)
     rgb = rgba[:, :, :3].astype(np.float32)
     distance = np.linalg.norm(rgb - bg[None, None, :], axis=2)
     return distance <= float(threshold)
+
+
+def _low_chroma_light_mask(image: Image.Image, min_value: int = 210, max_chroma: int = 16) -> np.ndarray:
+    rgba = pil_to_rgba_array(image)
+    rgb = rgba[:, :, :3].astype(np.int16)
+    value = rgb.max(axis=2)
+    chroma = rgb.max(axis=2) - rgb.min(axis=2)
+    return (value >= int(min_value)) & (chroma <= int(max_chroma))
 
 
 def _border_connected(binary: np.ndarray) -> np.ndarray:
@@ -22,14 +30,7 @@ def _border_connected(binary: np.ndarray) -> np.ndarray:
 
     _n, labels = cv2.connectedComponents(b, connectivity=8)
     border_labels = np.unique(
-        np.concatenate(
-            [
-                labels[0, :],
-                labels[-1, :],
-                labels[:, 0],
-                labels[:, -1],
-            ]
-        )
+        np.concatenate([labels[0, :], labels[-1, :], labels[:, 0], labels[:, -1]])
     )
     border_labels = border_labels[border_labels != 0]
     if border_labels.size == 0:
@@ -37,7 +38,7 @@ def _border_connected(binary: np.ndarray) -> np.ndarray:
     return np.isin(labels, border_labels)
 
 
-def _inner_boundary(mask: np.ndarray, width: int = 2) -> np.ndarray:
+def _inner_boundary(mask: np.ndarray, width: int = 1) -> np.ndarray:
     if width <= 0:
         return np.zeros_like(mask, dtype=bool)
     m = mask.astype(np.uint8)
@@ -50,41 +51,49 @@ def _inner_boundary(mask: np.ndarray, width: int = 2) -> np.ndarray:
 def refine_foreground_mask_against_background(
     image: Image.Image,
     mask: np.ndarray,
-    bg_threshold: float = 34.0,
-    fringe_width: int = 2,
+    mode: str = "safe",
+    bg_threshold: float = 24.0,
+    fringe_width: int = 1,
 ) -> np.ndarray:
-    """Refine a foreground mask for white/off-white studio backgrounds.
+    """Refine a foreground mask without assuming a white background.
 
-    This fixes two common failure modes:
-    - near-white halo pixels left around the outer silhouette
-    - background holes between body parts, such as the space between an arm and torso
+    Modes:
+      safe       : morphology only; does not delete pixels by color.
+      aggressive : additionally removes only border-connected, low-chroma light
+                   pixels. Use only for studio white/off-white backgrounds.
+      off        : return mask unchanged.
 
-    The cleanup is intentionally conservative: it mainly removes background-like
-    regions that are connected to the image border, so white clothing or white
-    foreground details that are not connected to the border are less likely to be
-    deleted.
+    The default is intentionally conservative because character skin, blonde
+    hair, light clothing, and antialiased edges can be close to a white or gray
+    background. Background cleanup by color is only safe when explicitly enabled.
     """
+    mode = (mode or "safe").lower().strip()
     m = mask.astype(bool)
 
-    # Do not fill holes for human/character cutouts. Arm gaps and negative space
-    # are valid background and must remain removable.
-    m = clean_mask(m, open_size=2, close_size=3, fill_holes=False)
+    if mode in {"off", "none", "false", "0"}:
+        return m
 
+    # Never fill holes for character cutouts. Spaces between arms, legs, hair,
+    # and torso are valid background and should remain removable.
+    m = clean_mask(m, open_size=1, close_size=2, fill_holes=False)
+
+    if mode not in {"aggressive", "white", "white-bg", "white_bg"}:
+        return m.astype(bool)
+
+    # Aggressive mode is restricted to low-chroma light pixels to avoid deleting
+    # bright skin or colored foreground edges. It is deliberately not the default.
     bg_like = _background_like_mask(image, threshold=bg_threshold)
-    border_bg = _border_connected(bg_like)
+    light_neutral = _low_chroma_light_mask(image)
+    removable_bg = bg_like & light_neutral
 
-    # Clear all background-colored pixels connected to the canvas border. This
-    # removes both the outside background and background-colored negative spaces
-    # that visually connect to the outside, even if the model marked them opaque.
+    border_bg = _border_connected(removable_bg)
     m = m & ~border_bg
 
-    # Clear near-white pixels on the inner mask boundary to remove white fringing.
     if fringe_width > 0:
         boundary = _inner_boundary(m, width=fringe_width)
-        m = m & ~(boundary & bg_like)
+        m = m & ~(boundary & removable_bg)
 
-    # Final tiny speck cleanup without hole filling.
-    m = clean_mask(m, open_size=1, close_size=2, fill_holes=False)
+    m = clean_mask(m, open_size=1, close_size=1, fill_holes=False)
     return m.astype(bool)
 
 
