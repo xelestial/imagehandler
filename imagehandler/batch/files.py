@@ -5,6 +5,7 @@ from pathlib import Path
 import shutil
 
 SUPPORTED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+IGNORED_WORKSPACE_PARTS = {"complete", "failed", "output", "reports", "tmp"}
 
 
 @dataclass
@@ -16,6 +17,7 @@ class BatchResult:
     outputs: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
     moved_to_complete: list[str] = field(default_factory=list)
+    moved_to_failed: list[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -26,12 +28,12 @@ def _is_supported_image(path: Path) -> bool:
     return path.is_file() and path.suffix.lower() in SUPPORTED_IMAGE_SUFFIXES
 
 
-def _is_under_complete(path: Path, root: Path) -> bool:
+def _has_ignored_part(path: Path, root: Path) -> bool:
     try:
         rel = path.relative_to(root)
     except ValueError:
         return False
-    return "complete" in rel.parts
+    return any(part in IGNORED_WORKSPACE_PARTS for part in rel.parts)
 
 
 def iter_image_files(input_path: str | Path, recursive: bool = False, pattern: str | None = None) -> list[Path]:
@@ -44,7 +46,7 @@ def iter_image_files(input_path: str | Path, recursive: bool = False, pattern: s
     for p in candidates:
         if not _is_supported_image(p):
             continue
-        if _is_under_complete(p, root):
+        if _has_ignored_part(p, root):
             continue
         files.append(p)
     return files
@@ -66,13 +68,17 @@ def relative_output_dir(input_file: Path, input_root: Path, output_root: Path) -
     return output_root / rel
 
 
-def complete_root_for_input_root(input_root: Path) -> Path:
+def _bucket_root_for_input_root(input_root: Path, bucket: str) -> Path:
+    # Optimized layout:
+    #   workspace/sheets/input/a.png -> workspace/sheets/complete/a.png
+    #   workspace/sheets/input/a.png -> workspace/sheets/failed/a.png
     if input_root.name == "input":
-        return input_root.parent / "complete"
-    return input_root / "complete"
+        return input_root.parent / bucket
+    # Backward-compatible fallback for arbitrary folders.
+    return input_root / bucket
 
 
-def move_input_to_complete(input_file: Path, input_root: Path) -> Path | None:
+def _move_input_to_bucket(input_file: Path, input_root: Path, bucket: str) -> Path | None:
     input_file = Path(input_file)
     input_root = Path(input_root)
 
@@ -84,11 +90,10 @@ def move_input_to_complete(input_file: Path, input_root: Path) -> Path | None:
     except ValueError:
         return None
 
-    if "complete" in rel.parts:
+    if any(part in {"complete", "failed"} for part in rel.parts):
         return None
 
-    complete_root = complete_root_for_input_root(input_root)
-    dst = complete_root / rel
+    dst = _bucket_root_for_input_root(input_root, bucket) / rel
     dst.parent.mkdir(parents=True, exist_ok=True)
 
     if dst.exists():
@@ -104,3 +109,11 @@ def move_input_to_complete(input_file: Path, input_root: Path) -> Path | None:
 
     shutil.move(str(input_file), str(dst))
     return dst
+
+
+def move_input_to_complete(input_file: Path, input_root: Path) -> Path | None:
+    return _move_input_to_bucket(input_file, input_root, "complete")
+
+
+def move_input_to_failed(input_file: Path, input_root: Path) -> Path | None:
+    return _move_input_to_bucket(input_file, input_root, "failed")
