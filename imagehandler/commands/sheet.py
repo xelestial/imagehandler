@@ -5,7 +5,13 @@ from typing import Optional
 
 import typer
 
-from imagehandler.batch import BatchResult, iter_image_files, move_input_to_complete, relative_output_dir
+from imagehandler.batch import (
+    BatchResult,
+    iter_image_files,
+    move_input_to_complete,
+    move_input_to_failed,
+    relative_output_dir,
+)
 from imagehandler.fallback import split_sheet_with_retry
 from imagehandler.split_sheet import split_sheet
 from imagehandler.workspace import resolve_output_for_task
@@ -18,9 +24,9 @@ app = typer.Typer(no_args_is_help=True, help="Character sheet splitting menu.")
 @app.command("split")
 def split_cmd(
     input_path: Path = typer.Argument(..., exists=True, readable=True),
-    output_dir: Optional[Path] = typer.Option(None, "--output", "-o", help="Output directory. If omitted, auto-create a job folder under workspace/jobs/."),
+    output_dir: Optional[Path] = typer.Option(None, "--output", "-o", help="Output directory. If omitted, use workspace/sheets/output/<job>/."),
     workspace: Optional[Path] = typer.Option(None, help="Workspace root used when --output is omitted. Default: ./workspace"),
-    job: Optional[str] = typer.Option(None, help="Optional job folder name. If omitted, use the input filename. If the name already exists, a date suffix is appended."),
+    job: Optional[str] = typer.Option(None, help="Optional output job folder name. If omitted, use the input filename."),
     views: int = typer.Option(4, help="Number of expected views."),
     padding: int = typer.Option(24),
     min_area: int = typer.Option(1000),
@@ -69,7 +75,7 @@ def split_cmd(
 @app.command("batch-split")
 def batch_split_cmd(
     input_path: Path = typer.Argument(..., exists=True, readable=True),
-    output_dir: Optional[Path] = typer.Option(None, "--output", "-o", help="Output directory. If omitted, auto-create one job folder per file under workspace/jobs/."),
+    output_dir: Optional[Path] = typer.Option(None, "--output", "-o", help="Output directory. If omitted, use workspace/sheets/output/<job>/ per file."),
     workspace: Optional[Path] = typer.Option(None, help="Workspace root used when --output is omitted. Default: ./workspace"),
     recursive: bool = typer.Option(False),
     pattern: Optional[str] = typer.Option(None),
@@ -86,13 +92,13 @@ def batch_split_cmd(
     files = iter_image_files(input_path, recursive=recursive, pattern=pattern)
     result = BatchResult(operation="sheet batch-split", total=len(files))
     root = input_path if input_path.is_dir() else input_path.parent
-    auto_job_outputs = []
+    output_jobs = []
     if output_dir is not None:
         output_dir.mkdir(parents=True, exist_ok=True)
     for src in files:
         if output_dir is None:
             dst_dir, job_paths = resolve_output_for_task("sheets", src, None, workspace, None)
-            auto_job_outputs.append(str(job_paths.job_root) if job_paths else str(dst_dir.parent))
+            output_jobs.append(str(job_paths.output_root) if job_paths else str(dst_dir))
         else:
             dst_dir = relative_output_dir(src, root, output_dir)
         try:
@@ -108,9 +114,11 @@ def batch_split_cmd(
         except Exception as exc:
             result.failed += 1
             result.errors.append(f"{src}: {exc}")
+            moved = move_input_to_failed(src, root)
+            if moved is not None:
+                result.moved_to_failed.append(str(moved))
             if not continue_on_error:
                 raise
     print_batch_result(result)
-    if auto_job_outputs:
-        for item in auto_job_outputs:
-            typer.echo(f"job folder: {item}")
+    for item in output_jobs:
+        typer.echo(f"output job folder: {item}")
