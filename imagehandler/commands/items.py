@@ -5,7 +5,13 @@ from typing import Optional
 
 import typer
 
-from imagehandler.batch import BatchResult, iter_image_files, move_input_to_complete, relative_output_dir
+from imagehandler.batch import (
+    BatchResult,
+    iter_image_files,
+    move_input_to_failed,
+    move_input_to_job_input,
+    relative_output_dir,
+)
 from imagehandler.extract_items import extract_items
 from imagehandler.fallback import extract_items_with_retry
 from imagehandler.workspace import resolve_output_for_task
@@ -18,9 +24,9 @@ app = typer.Typer(no_args_is_help=True, help="Item and equipment sheet extractio
 @app.command("extract")
 def extract_cmd(
     input_path: Path = typer.Argument(..., exists=True, readable=True),
-    output_dir: Optional[Path] = typer.Option(None, "--output", "-o", help="Output directory. If omitted, auto-create a job folder under workspace/jobs/."),
+    output_dir: Optional[Path] = typer.Option(None, "--output", "-o", help="Output directory. If omitted, use workspace/items/jobs/<job>/output/."),
     workspace: Optional[Path] = typer.Option(None, help="Workspace root used when --output is omitted. Default: ./workspace"),
-    job: Optional[str] = typer.Option(None, help="Optional job folder name. If omitted, use the input filename. If the name already exists, a date suffix is appended."),
+    job: Optional[str] = typer.Option(None, help="Optional job folder name. If omitted, use the input filename."),
     padding: int = typer.Option(16),
     min_area: int = typer.Option(120),
     merge_distance: int = typer.Option(12),
@@ -74,7 +80,7 @@ def extract_cmd(
 @app.command("batch-extract")
 def batch_extract_cmd(
     input_path: Path = typer.Argument(..., exists=True, readable=True),
-    output_dir: Optional[Path] = typer.Option(None, "--output", "-o", help="Output directory. If omitted, auto-create one job folder per file under workspace/jobs/."),
+    output_dir: Optional[Path] = typer.Option(None, "--output", "-o", help="Output directory. If omitted, use workspace/items/jobs/<job>/output/ per file."),
     workspace: Optional[Path] = typer.Option(None, help="Workspace root used when --output is omitted. Default: ./workspace"),
     recursive: bool = typer.Option(False),
     pattern: Optional[str] = typer.Option(None),
@@ -93,13 +99,14 @@ def batch_extract_cmd(
     files = iter_image_files(input_path, recursive=recursive, pattern=pattern)
     result = BatchResult(operation="items batch-extract", total=len(files))
     root = input_path if input_path.is_dir() else input_path.parent
-    auto_job_outputs = []
+    output_jobs = []
     if output_dir is not None:
         output_dir.mkdir(parents=True, exist_ok=True)
     for src in files:
+        job_paths = None
         if output_dir is None:
             dst_dir, job_paths = resolve_output_for_task("items", src, None, workspace, None)
-            auto_job_outputs.append(str(job_paths.job_root) if job_paths else str(dst_dir.parent))
+            output_jobs.append(str(job_paths.output_root) if job_paths else str(dst_dir))
         else:
             dst_dir = relative_output_dir(src, root, output_dir)
         try:
@@ -109,15 +116,18 @@ def batch_extract_cmd(
                 extract_items(src, dst_dir, padding=padding, min_area=min_area, merge_distance=merge_distance, square_canvas=square_canvas, normalize=normalize_size, transparent_bg=transparent_bg, threshold=threshold, debug=debug)
             result.succeeded += 1
             result.outputs.append(str(dst_dir))
-            moved = move_input_to_complete(src, root)
-            if moved is not None:
-                result.moved_to_complete.append(str(moved))
+            if job_paths is not None:
+                moved = move_input_to_job_input(src, root, job_paths.input_root)
+                if moved is not None:
+                    result.moved_to_job_input.append(str(moved))
         except Exception as exc:
             result.failed += 1
             result.errors.append(f"{src}: {exc}")
+            moved = move_input_to_failed(src, root)
+            if moved is not None:
+                result.moved_to_failed.append(str(moved))
             if not continue_on_error:
                 raise
     print_batch_result(result)
-    if auto_job_outputs:
-        for item in auto_job_outputs:
-            typer.echo(f"job folder: {item}")
+    for item in output_jobs:
+        typer.echo(f"output job folder: {item}")
