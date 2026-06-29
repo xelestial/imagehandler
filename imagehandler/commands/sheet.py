@@ -8,8 +8,8 @@ import typer
 from imagehandler.batch import (
     BatchResult,
     iter_image_files,
-    move_input_to_complete,
     move_input_to_failed,
+    move_input_to_job_input,
     relative_output_dir,
 )
 from imagehandler.fallback import split_sheet_with_retry
@@ -24,9 +24,9 @@ app = typer.Typer(no_args_is_help=True, help="Character sheet splitting menu.")
 @app.command("split")
 def split_cmd(
     input_path: Path = typer.Argument(..., exists=True, readable=True),
-    output_dir: Optional[Path] = typer.Option(None, "--output", "-o", help="Output directory. If omitted, use workspace/sheets/output/<job>/."),
+    output_dir: Optional[Path] = typer.Option(None, "--output", "-o", help="Output directory. If omitted, use workspace/sheets/jobs/<job>/output/."),
     workspace: Optional[Path] = typer.Option(None, help="Workspace root used when --output is omitted. Default: ./workspace"),
-    job: Optional[str] = typer.Option(None, help="Optional output job folder name. If omitted, use the input filename."),
+    job: Optional[str] = typer.Option(None, help="Optional job folder name. If omitted, use the input filename."),
     views: int = typer.Option(4, help="Number of expected views."),
     padding: int = typer.Option(24),
     min_area: int = typer.Option(1000),
@@ -75,7 +75,7 @@ def split_cmd(
 @app.command("batch-split")
 def batch_split_cmd(
     input_path: Path = typer.Argument(..., exists=True, readable=True),
-    output_dir: Optional[Path] = typer.Option(None, "--output", "-o", help="Output directory. If omitted, use workspace/sheets/output/<job>/ per file."),
+    output_dir: Optional[Path] = typer.Option(None, "--output", "-o", help="Output directory. If omitted, use workspace/sheets/jobs/<job>/output/ per file."),
     workspace: Optional[Path] = typer.Option(None, help="Workspace root used when --output is omitted. Default: ./workspace"),
     recursive: bool = typer.Option(False),
     pattern: Optional[str] = typer.Option(None),
@@ -96,6 +96,7 @@ def batch_split_cmd(
     if output_dir is not None:
         output_dir.mkdir(parents=True, exist_ok=True)
     for src in files:
+        job_paths = None
         if output_dir is None:
             dst_dir, job_paths = resolve_output_for_task("sheets", src, None, workspace, None)
             output_jobs.append(str(job_paths.output_root) if job_paths else str(dst_dir))
@@ -108,9 +109,10 @@ def batch_split_cmd(
                 split_sheet(src, dst_dir, views=views, padding=padding, min_area=min_area, merge_distance=merge_distance, normalize=normalize_size, threshold=threshold, debug=debug)
             result.succeeded += 1
             result.outputs.append(str(dst_dir))
-            moved = move_input_to_complete(src, root)
-            if moved is not None:
-                result.moved_to_complete.append(str(moved))
+            if job_paths is not None:
+                moved = move_input_to_job_input(src, root, job_paths.input_root)
+                if moved is not None:
+                    result.moved_to_job_input.append(str(moved))
         except Exception as exc:
             result.failed += 1
             result.errors.append(f"{src}: {exc}")
