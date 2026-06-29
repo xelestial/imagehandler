@@ -12,11 +12,10 @@ fail() { printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
 cd "$ROOT_DIR"
 
 mkdir -p \
-  "$WORKSPACE_DIR/bg/input" "$WORKSPACE_DIR/bg/complete" "$WORKSPACE_DIR/bg/jobs" \
-  "$WORKSPACE_DIR/sheets/input" "$WORKSPACE_DIR/sheets/complete" "$WORKSPACE_DIR/sheets/jobs" \
-  "$WORKSPACE_DIR/items/input" "$WORKSPACE_DIR/items/complete" "$WORKSPACE_DIR/items/jobs" \
-  "$WORKSPACE_DIR/quality/input" "$WORKSPACE_DIR/quality/complete" "$WORKSPACE_DIR/quality/jobs" \
-  "$WORKSPACE_DIR/archive" "$WORKSPACE_DIR/_reports"
+  "$WORKSPACE_DIR/bg/input" "$WORKSPACE_DIR/bg/jobs" "$WORKSPACE_DIR/bg/failed" \
+  "$WORKSPACE_DIR/sheets/input" "$WORKSPACE_DIR/sheets/jobs" "$WORKSPACE_DIR/sheets/failed" \
+  "$WORKSPACE_DIR/items/input" "$WORKSPACE_DIR/items/jobs" "$WORKSPACE_DIR/items/failed" \
+  "$WORKSPACE_DIR/reports"
 
 if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
   warn "Do not run this with sudo unless you intentionally want root-owned output files."
@@ -40,24 +39,26 @@ source "$VENV_DIR/bin/activate"
 print_workspace_hint() {
   cat <<EOF
 
-Task-first workspace folders are ready:
+Optimized workspace folders are ready:
 
-  Background removal input:
+  BG input:
     $WORKSPACE_DIR/bg/input
 
-  Character sheet input:
+  Sheets input:
     $WORKSPACE_DIR/sheets/input
 
-  Item/equipment sheet input:
+  Items input:
     $WORKSPACE_DIR/items/input
 
-  Results:
-    $WORKSPACE_DIR/<task>/jobs/<job_name>/output
+  Success flow:
+    $WORKSPACE_DIR/<task>/input/source.png
+    -> $WORKSPACE_DIR/<task>/jobs/<job_name>/input/source.png
+    -> $WORKSPACE_DIR/<task>/jobs/<job_name>/output/
 
-  Completed source files:
-    $WORKSPACE_DIR/<task>/complete
+  Failure flow:
+    $WORKSPACE_DIR/<task>/failed/source.png
 
-Put your image files into the matching input folder, then choose Quick run.
+Put files into the matching input folder, then choose Quick run.
 
 EOF
 }
@@ -85,27 +86,24 @@ Usage:
   ./run.sh menu
   ./run.sh <imagehandler CLI args>
 
-Task-first folders:
-  workspace/bg/input        background-removal source images
-  workspace/bg/jobs         background-removal results
-  workspace/bg/complete     completed background-removal source images
+Optimized workspace:
+  workspace/bg/input       background-removal source images
+  workspace/bg/jobs        per-image background-removal jobs
+  workspace/bg/failed      failed background-removal source images
 
-  workspace/sheets/input    character-sheet source images
-  workspace/sheets/jobs     character-sheet results
-  workspace/sheets/complete completed character-sheet source images
+  workspace/sheets/input   character-sheet source images
+  workspace/sheets/jobs    per-sheet split jobs
+  workspace/sheets/failed  failed character-sheet source images
 
-  workspace/items/input     item/equipment-sheet source images
-  workspace/items/jobs      item/equipment-sheet results
-  workspace/items/complete  completed item/equipment-sheet source images
+  workspace/items/input    item/equipment-sheet source images
+  workspace/items/jobs     per-sheet extraction jobs
+  workspace/items/failed   failed item/equipment source images
 
 Examples:
   ./run.sh
   ./run.sh bg batch-remove workspace/bg/input --workspace ./workspace --recursive
   ./run.sh sheet batch-split workspace/sheets/input --workspace ./workspace --views 4 --recursive
   ./run.sh items batch-extract workspace/items/input --workspace ./workspace --recursive
-
-Notes:
-  Do not run ./imagehandler. imagehandler/ is a Python package folder.
 USAGE
     ;;
   *)
