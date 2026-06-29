@@ -5,7 +5,13 @@ from typing import Optional
 
 import typer
 
-from imagehandler.batch import BatchResult, iter_image_files, move_input_to_complete, relative_output_file
+from imagehandler.batch import (
+    BatchResult,
+    iter_image_files,
+    move_input_to_complete,
+    move_input_to_failed,
+    relative_output_file,
+)
 from imagehandler.bg_remove import remove_background
 from imagehandler.fallback import remove_background_with_fallback
 from imagehandler.workspace import resolve_output_for_task
@@ -18,9 +24,9 @@ app = typer.Typer(no_args_is_help=True, help="Background removal menu.")
 @app.command("remove")
 def remove_cmd(
     input_path: Path = typer.Argument(..., exists=True, readable=True),
-    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Output PNG path. If omitted, auto-create a job folder under workspace/jobs/."),
+    output: Optional[Path] = typer.Option(None, "--output", "-o", help="Output PNG path. If omitted, use workspace/bg/output/<job>/.") ,
     workspace: Optional[Path] = typer.Option(None, help="Workspace root used when --output is omitted. Default: ./workspace"),
-    job: Optional[str] = typer.Option(None, help="Optional job folder name. If omitted, use the input filename. If the name already exists, a date suffix is appended."),
+    job: Optional[str] = typer.Option(None, help="Optional output job folder name. If omitted, use the input filename."),
     backend: str = typer.Option("auto", help="auto, rembg, transparent, classical"),
     model: Optional[str] = typer.Option(None, help="rembg model name."),
     alpha_matting: bool = typer.Option(False, help="Enable rembg alpha matting."),
@@ -66,7 +72,7 @@ def remove_cmd(
 @app.command("batch-remove")
 def batch_remove_cmd(
     input_path: Path = typer.Argument(..., exists=True, readable=True, help="Image file or input directory."),
-    output_dir: Optional[Path] = typer.Option(None, "--output", "-o", help="Output directory. If omitted, auto-create one job folder per file under workspace/jobs/."),
+    output_dir: Optional[Path] = typer.Option(None, "--output", "-o", help="Output directory. If omitted, use workspace/bg/output/<job>/ per file."),
     workspace: Optional[Path] = typer.Option(None, help="Workspace root used when --output is omitted. Default: ./workspace"),
     recursive: bool = typer.Option(False, help="Search recursively."),
     pattern: Optional[str] = typer.Option(None, help="Glob pattern. Example: '**/*.png'"),
@@ -79,13 +85,13 @@ def batch_remove_cmd(
     files = iter_image_files(input_path, recursive=recursive, pattern=pattern)
     result = BatchResult(operation="bg batch-remove", total=len(files))
     root = input_path if input_path.is_dir() else input_path.parent
-    auto_job_outputs = []
+    output_jobs = []
     if output_dir is not None:
         output_dir.mkdir(parents=True, exist_ok=True)
     for src in files:
         if output_dir is None:
             dst, job_paths = resolve_output_for_task("bg", src, None, workspace, None)
-            auto_job_outputs.append(str(job_paths.job_root) if job_paths else str(dst.parent))
+            output_jobs.append(str(job_paths.output_root) if job_paths else str(dst.parent))
         else:
             dst = relative_output_file(src, root, output_dir, suffix=".png")
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -102,9 +108,11 @@ def batch_remove_cmd(
         except Exception as exc:
             result.failed += 1
             result.errors.append(f"{src}: {exc}")
+            moved = move_input_to_failed(src, root)
+            if moved is not None:
+                result.moved_to_failed.append(str(moved))
             if not continue_on_error:
                 raise
     print_batch_result(result)
-    if auto_job_outputs:
-        for item in auto_job_outputs:
-            typer.echo(f"job folder: {item}")
+    for item in output_jobs:
+        typer.echo(f"output job folder: {item}")
