@@ -1,0 +1,20 @@
+ImageHandler quick start
+
+1) Unzip this package.
+2) cd imagehandler_full_package
+3) Run:
+   chmod +x dependency.sh setup.sh run.sh
+   ./dependency.sh
+4) Put source images into:
+   workspace/inbox/bg       background-removal images
+   workspace/inbox/sheets   character-sheet images
+   workspace/inbox/items    item/equipment-sheet images
+5) Run:
+   ./run.sh
+
+Menu structure:
+- Quick run: minimal prompts, uses saved config and default inbox folders
+- Config: choose fast / balanced / high_quality and single/batch mode
+- Advanced menu: full manual prompts
+
+6) After batch success, processed input files are moved to a complete/ folder under the same inbox path.
