@@ -5,8 +5,8 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PYTHON_VERSION="${PYTHON_VERSION:-3.12}"
 PYTHON_BIN_FILE="$ROOT_DIR/.python-bin"
 ENV_FILE="$ROOT_DIR/.imagehandler-env"
-INSTALL=0
-RUN_SETUP=0
+INSTALL=1
+RUN_SETUP=1
 FIX_OWNER=0
 SETUP_ARGS=()
 
@@ -21,20 +21,34 @@ fail() { printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
 
 usage() {
   cat <<'USAGE'
-Usage: ./dependency.sh [--check] [--install] [--run-setup] [--fix-owner] [--python 3.12]
+Usage: ./dependency.sh [options]
+
+Default behavior:
+  Installs/checks system dependencies, finds Python 3.11-3.13, then runs ./setup.sh.
+
+Options:
+  --check-only       Only check dependencies. Do not install and do not run setup.sh.
+  --no-setup         Install/check dependencies but do not run setup.sh.
+  --fix-owner        Fix local project ownership if previous sudo runs created root-owned files.
+  --python 3.12      Preferred Python version. Default: 3.12
+  --setup-arg ARG    Pass one argument to setup.sh. Can be repeated.
+  -h, --help         Show this help.
 
 Examples:
-  ./dependency.sh --install
-  ./dependency.sh --install --run-setup
-  PYTHON_BIN="$(cat .python-bin)" ./setup.sh
+  ./dependency.sh
+  ./dependency.sh --fix-owner
+  ./dependency.sh --check-only
+  ./dependency.sh --no-setup
+  ./dependency.sh --setup-arg --workspace --setup-arg ./workspace
 USAGE
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --check) INSTALL=0 ;;
-    --install) INSTALL=1 ;;
-    --run-setup) RUN_SETUP=1 ;;
+    --check|--check-only) INSTALL=0; RUN_SETUP=0 ;;
+    --install) INSTALL=1 ;; # kept for backward compatibility; now default
+    --run-setup) RUN_SETUP=1 ;; # kept for backward compatibility; now default
+    --no-setup) RUN_SETUP=0 ;;
     --fix-owner) FIX_OWNER=1 ;;
     --python) PYTHON_VERSION="$2"; shift ;;
     --setup-arg) SETUP_ARGS+=("$2"); shift ;;
@@ -95,7 +109,7 @@ ensure_brew() {
     export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:$PATH"
     command -v brew >/dev/null 2>&1 && eval "$(brew shellenv)" || true
   else
-    warn 'Install Homebrew or rerun with --install.'
+    warn 'Install Homebrew or rerun without --check-only.'
   fi
 }
 
