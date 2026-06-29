@@ -1,8 +1,8 @@
 from .files import (
     BatchResult,
     iter_image_files,
-    move_input_to_complete,
     move_input_to_failed,
+    move_input_to_job_input,
     relative_output_dir,
     relative_output_file,
 )
@@ -10,8 +10,8 @@ from .files import (
 __all__ = [
     "BatchResult",
     "iter_image_files",
-    "move_input_to_complete",
     "move_input_to_failed",
+    "move_input_to_job_input",
     "relative_output_dir",
     "relative_output_file",
 ]
