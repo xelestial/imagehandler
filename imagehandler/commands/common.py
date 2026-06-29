@@ -45,17 +45,22 @@ def print_fallback_summary(summary) -> None:
         console.print(f"  - {attempt.name} -> {attempt.verdict} {attempt.score} ({state})")
 
 
+def _print_moved(title: str, moved: list[str], color: str) -> None:
+    if not moved:
+        return
+    console.print(f"[{color}]{title}:[/{color}] {len(moved)} file(s)")
+    preview = moved[:5]
+    for item in preview:
+        console.print(f"  - {item}")
+    if len(moved) > len(preview):
+        console.print(f"  ... {len(moved) - len(preview)} more")
+
+
 def print_batch_result(result) -> None:
     color = "green" if result.ok else "red"
     console.print(f"[{color}][bold]{result.operation}[/bold][/{color}] total={result.total} ok={result.succeeded} failed={result.failed}")
-    moved = getattr(result, "moved_to_complete", None)
-    if moved:
-        console.print(f"[cyan]moved to complete:[/cyan] {len(moved)} file(s)")
-        preview = moved[:5]
-        for item in preview:
-            console.print(f"  - {item}")
-        if len(moved) > len(preview):
-            console.print(f"  ... {len(moved) - len(preview)} more")
+    _print_moved("moved to complete", getattr(result, "moved_to_complete", []) or [], "cyan")
+    _print_moved("moved to failed", getattr(result, "moved_to_failed", []) or [], "yellow")
     if result.errors:
         console.print("[red]errors:[/red]")
         for item in result.errors:
@@ -65,5 +70,4 @@ def print_batch_result(result) -> None:
 def print_job_paths(job_paths) -> None:
     if job_paths is None:
         return
-    console.print("[cyan]job folder:[/cyan] " + str(job_paths.job_root))
-    console.print("[cyan]outputs:[/cyan] " + str(job_paths.output_root))
+    console.print("[cyan]output job folder:[/cyan] " + str(job_paths.output_root))
