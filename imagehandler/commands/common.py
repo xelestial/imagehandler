@@ -59,8 +59,8 @@ def _print_moved(title: str, moved: list[str], color: str) -> None:
 def print_batch_result(result) -> None:
     color = "green" if result.ok else "red"
     console.print(f"[{color}][bold]{result.operation}[/bold][/{color}] total={result.total} ok={result.succeeded} failed={result.failed}")
-    _print_moved("moved to complete", getattr(result, "moved_to_complete", []) or [], "cyan")
-    _print_moved("moved to failed", getattr(result, "moved_to_failed", []) or [], "yellow")
+    _print_moved("moved source to job input", getattr(result, "moved_to_job_input", []) or [], "cyan")
+    _print_moved("moved source to failed", getattr(result, "moved_to_failed", []) or [], "yellow")
     if result.errors:
         console.print("[red]errors:[/red]")
         for item in result.errors:
@@ -70,4 +70,6 @@ def print_batch_result(result) -> None:
 def print_job_paths(job_paths) -> None:
     if job_paths is None:
         return
-    console.print("[cyan]output job folder:[/cyan] " + str(job_paths.output_root))
+    console.print("[cyan]job folder:[/cyan] " + str(job_paths.job_root))
+    console.print("[cyan]source archive:[/cyan] " + str(job_paths.input_root))
+    console.print("[cyan]outputs:[/cyan] " + str(job_paths.output_root))
