@@ -12,12 +12,11 @@ fail() { printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
 cd "$ROOT_DIR"
 
 mkdir -p \
-  "$WORKSPACE_DIR/inbox/bg" \
-  "$WORKSPACE_DIR/inbox/sheets" \
-  "$WORKSPACE_DIR/inbox/items" \
-  "$WORKSPACE_DIR/jobs" \
-  "$WORKSPACE_DIR/archive" \
-  "$WORKSPACE_DIR/_reports"
+  "$WORKSPACE_DIR/bg/input" "$WORKSPACE_DIR/bg/complete" "$WORKSPACE_DIR/bg/jobs" \
+  "$WORKSPACE_DIR/sheets/input" "$WORKSPACE_DIR/sheets/complete" "$WORKSPACE_DIR/sheets/jobs" \
+  "$WORKSPACE_DIR/items/input" "$WORKSPACE_DIR/items/complete" "$WORKSPACE_DIR/items/jobs" \
+  "$WORKSPACE_DIR/quality/input" "$WORKSPACE_DIR/quality/complete" "$WORKSPACE_DIR/quality/jobs" \
+  "$WORKSPACE_DIR/archive" "$WORKSPACE_DIR/_reports"
 
 if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
   warn "Do not run this with sudo unless you intentionally want root-owned output files."
@@ -36,31 +35,35 @@ if [[ ! -d "$VENV_DIR" ]]; then
   fi
 fi
 
-# shellcheck disable=SC1091
 source "$VENV_DIR/bin/activate"
 
-print_inbox_hint() {
+print_workspace_hint() {
   cat <<EOF
 
-Workspace folders are ready:
+Task-first workspace folders are ready:
 
   Background removal input:
-    $WORKSPACE_DIR/inbox/bg
+    $WORKSPACE_DIR/bg/input
 
   Character sheet input:
-    $WORKSPACE_DIR/inbox/sheets
+    $WORKSPACE_DIR/sheets/input
 
   Item/equipment sheet input:
-    $WORKSPACE_DIR/inbox/items
+    $WORKSPACE_DIR/items/input
 
-Put your image files into the matching folder, then choose a menu action.
-When the menu asks for an input path, press Enter to use the default inbox folder.
+  Results:
+    $WORKSPACE_DIR/<task>/jobs/<job_name>/output
+
+  Completed source files:
+    $WORKSPACE_DIR/<task>/complete
+
+Put your image files into the matching input folder, then choose Quick run.
 
 EOF
 }
 
 if [[ $# -eq 0 ]]; then
-  print_inbox_hint
+  print_workspace_hint
   log "Launching interactive menu"
   IMAGEHANDLER_WORKSPACE="$WORKSPACE_DIR" python -m imagehandler.cli menu
   exit $?
@@ -69,7 +72,7 @@ fi
 case "$1" in
   menu)
     shift
-    print_inbox_hint
+    print_workspace_hint
     log "Launching interactive menu"
     IMAGEHANDLER_WORKSPACE="$WORKSPACE_DIR" python -m imagehandler.cli menu "$@"
     ;;
@@ -82,18 +85,24 @@ Usage:
   ./run.sh menu
   ./run.sh <imagehandler CLI args>
 
-Default folders:
-  workspace/inbox/bg       background-removal source images
-  workspace/inbox/sheets   character-sheet source images
-  workspace/inbox/items    item/equipment-sheet source images
-  workspace/jobs           per-job results
+Task-first folders:
+  workspace/bg/input        background-removal source images
+  workspace/bg/jobs         background-removal results
+  workspace/bg/complete     completed background-removal source images
+
+  workspace/sheets/input    character-sheet source images
+  workspace/sheets/jobs     character-sheet results
+  workspace/sheets/complete completed character-sheet source images
+
+  workspace/items/input     item/equipment-sheet source images
+  workspace/items/jobs      item/equipment-sheet results
+  workspace/items/complete  completed item/equipment-sheet source images
 
 Examples:
   ./run.sh
-  ./run.sh menu
-  ./run.sh bg batch-remove workspace/inbox/bg --workspace ./workspace --recursive
-  ./run.sh sheet batch-split workspace/inbox/sheets --workspace ./workspace --views 4 --recursive
-  ./run.sh items batch-extract workspace/inbox/items --workspace ./workspace --recursive
+  ./run.sh bg batch-remove workspace/bg/input --workspace ./workspace --recursive
+  ./run.sh sheet batch-split workspace/sheets/input --workspace ./workspace --views 4 --recursive
+  ./run.sh items batch-extract workspace/items/input --workspace ./workspace --recursive
 
 Notes:
   Do not run ./imagehandler. imagehandler/ is a Python package folder.
