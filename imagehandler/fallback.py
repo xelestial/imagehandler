@@ -7,7 +7,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Any
 
-from .bg_remove import remove_background
+from .bg_remove import DEFAULT_REMBG_MODEL, normalize_rembg_model, remove_background
 from .extract_items import extract_items
 from .judge import QualityReport, judge_directory, judge_image
 from .reports import OperationReport
@@ -15,6 +15,12 @@ from .split_sheet import split_sheet
 
 
 VERDICT_RANK = {"FAIL": 0, "WARN": 1, "PASS": 2}
+REMBG_MODEL_FALLBACKS = [
+    "birefnet-general",
+    "birefnet-portrait",
+    "isnet-anime",
+    "isnet-general-use",
+]
 
 
 @dataclass
@@ -76,8 +82,47 @@ def _is_acceptable(report: QualityReport, accept_verdict: str, min_score: float)
     return VERDICT_RANK.get(report.verdict, 0) >= VERDICT_RANK.get(accept_verdict, 2) and report.score >= min_score
 
 
-def _best_attempt(attempts: list[tuple[AttemptRecord, QualityReport, Any]]):
+def _best_attempt(attempts: list[tuple[AttemptRecord, QualityReport, Any, Path]]):
     return max(attempts, key=lambda item: (VERDICT_RANK.get(item[1].verdict, 0), item[1].score))
+
+
+def _attempt_name(backend: str, cfg: dict[str, Any]) -> str:
+    if backend == "rembg":
+        return f"rembg:{cfg.get('model') or DEFAULT_REMBG_MODEL}"
+    return backend
+
+
+def _append_unique(candidates: list[tuple[str, dict[str, Any]]], backend: str, cfg: dict[str, Any]) -> None:
+    if not any(existing_backend == backend and existing_cfg == cfg for existing_backend, existing_cfg in candidates):
+        candidates.append((backend, cfg))
+
+
+def _background_candidates(backend: str, model: str | None, alpha_matting: bool) -> list[tuple[str, dict[str, Any]]]:
+    backend = backend.lower()
+    candidates: list[tuple[str, dict[str, Any]]] = []
+
+    if backend == "auto":
+        first_model = normalize_rembg_model(model)
+        _append_unique(candidates, "rembg", {"model": first_model, "alpha_matting": bool(alpha_matting)})
+        for candidate_model in REMBG_MODEL_FALLBACKS:
+            _append_unique(candidates, "rembg", {"model": candidate_model, "alpha_matting": False})
+        _append_unique(candidates, "transparent", {})
+        _append_unique(candidates, "classical", {})
+        return candidates
+
+    if backend == "rembg":
+        first_model = normalize_rembg_model(model)
+        _append_unique(candidates, "rembg", {"model": first_model, "alpha_matting": bool(alpha_matting)})
+        for candidate_model in REMBG_MODEL_FALLBACKS:
+            _append_unique(candidates, "rembg", {"model": candidate_model, "alpha_matting": False})
+        return candidates
+
+    _append_unique(candidates, backend, {})
+    if backend != "transparent":
+        _append_unique(candidates, "transparent", {})
+    if backend != "classical":
+        _append_unique(candidates, "classical", {})
+    return candidates
 
 
 def remove_background_with_fallback(
@@ -93,20 +138,7 @@ def remove_background_with_fallback(
     min_score: float = 85.0,
 ) -> tuple[OperationReport, FallbackSummary]:
     output_path = Path(output_path)
-    candidates: list[tuple[str, dict[str, Any]]] = []
-
-    primary = backend if backend != "auto" else "rembg"
-    candidates.append((primary, {"model": model, "alpha_matting": alpha_matting}))
-
-    for name, cfg in [
-        ("rembg", {"model": model, "alpha_matting": True}),
-        ("transparent", {}),
-        ("classical", {}),
-    ]:
-        if name == primary and cfg == {"model": model, "alpha_matting": alpha_matting}:
-            continue
-        if not any(existing_name == name and existing_cfg == cfg for existing_name, existing_cfg in candidates):
-            candidates.append((name, cfg))
+    candidates = _background_candidates(backend, model, alpha_matting)
 
     attempts: list[tuple[AttemptRecord, QualityReport, OperationReport, Path]] = []
     selected_idx = 0
@@ -114,7 +146,9 @@ def remove_background_with_fallback(
     with TemporaryDirectory(prefix="imagehandler_bg_retry_") as tmpdir:
         tmp_root = Path(tmpdir)
         for idx, (candidate_backend, cfg) in enumerate(candidates, start=1):
-            attempt_output = tmp_root / f"attempt_{idx:02d}_{candidate_backend}.png"
+            name = _attempt_name(candidate_backend, cfg)
+            safe_name = name.replace(":", "_").replace("/", "_")
+            attempt_output = tmp_root / f"attempt_{idx:02d}_{safe_name}.png"
             try:
                 report = remove_background(
                     input_path=input_path,
@@ -125,6 +159,7 @@ def remove_background_with_fallback(
                     mask_only=mask_only,
                     postprocess=postprocess,
                     feather=feather,
+                    cleanup_mode="safe",
                 )
                 judge = judge_image(attempt_output, task="remove-bg", alpha_required=not mask_only)
             except Exception as exc:
@@ -136,11 +171,11 @@ def remove_background_with_fallback(
                     target=str(attempt_output),
                     failures=[f"attempt runtime error: {exc}"],
                 )
-                report = OperationReport(ok=False, operation="remove-bg", source=str(input_path), backend=candidate_backend)
+                report = OperationReport(ok=False, operation="remove-bg", source=str(input_path), backend=name)
 
             accepted = _is_acceptable(judge, accept_verdict, min_score)
             record = AttemptRecord(
-                name=f"{candidate_backend}:{cfg}",
+                name=name,
                 verdict=judge.verdict,
                 score=judge.score,
                 accepted=accepted,
@@ -177,6 +212,7 @@ def remove_background_with_fallback(
 
         selected_report.outputs = [str(output_path)] + ([str(final_mask)] if final_mask.exists() else [])
         selected_report.source = str(input_path)
+        selected_report.backend = selected_record.name
         selected_report.save(output_path.with_name(f"{output_path.stem}.report.json"))
         summary = FallbackSummary(
             operation="remove-bg",
