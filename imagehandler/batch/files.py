@@ -5,7 +5,7 @@ from pathlib import Path
 import shutil
 
 SUPPORTED_IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
-IGNORED_WORKSPACE_PARTS = {"complete", "failed", "output", "reports", "tmp"}
+IGNORED_WORKSPACE_PARTS = {"jobs", "failed", "reports", "tmp"}
 
 
 @dataclass
@@ -16,7 +16,7 @@ class BatchResult:
     failed: int = 0
     outputs: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
-    moved_to_complete: list[str] = field(default_factory=list)
+    moved_to_job_input: list[str] = field(default_factory=list)
     moved_to_failed: list[str] = field(default_factory=list)
 
     @property
@@ -68,52 +68,50 @@ def relative_output_dir(input_file: Path, input_root: Path, output_root: Path) -
     return output_root / rel
 
 
-def _bucket_root_for_input_root(input_root: Path, bucket: str) -> Path:
-    # Optimized layout:
-    #   workspace/sheets/input/a.png -> workspace/sheets/complete/a.png
-    #   workspace/sheets/input/a.png -> workspace/sheets/failed/a.png
-    if input_root.name == "input":
-        return input_root.parent / bucket
-    # Backward-compatible fallback for arbitrary folders.
-    return input_root / bucket
+def _safe_destination(dst: Path) -> Path:
+    if not dst.exists():
+        return dst
+    stem = dst.stem
+    suffix = dst.suffix
+    counter = 1
+    while True:
+        candidate = dst.with_name(f"{stem}_{counter}{suffix}")
+        if not candidate.exists():
+            return candidate
+        counter += 1
 
 
-def _move_input_to_bucket(input_file: Path, input_root: Path, bucket: str) -> Path | None:
+def _relative_source(input_file: Path, input_root: Path) -> Path | None:
     input_file = Path(input_file)
     input_root = Path(input_root)
-
     if not input_file.exists() or input_root.is_file():
         return None
-
     try:
-        rel = input_file.relative_to(input_root)
+        return input_file.relative_to(input_root)
     except ValueError:
         return None
 
-    if any(part in {"complete", "failed"} for part in rel.parts):
+
+def move_input_to_job_input(input_file: Path, input_root: Path, job_input_root: Path) -> Path | None:
+    rel = _relative_source(input_file, input_root)
+    if rel is None:
         return None
-
-    dst = _bucket_root_for_input_root(input_root, bucket) / rel
+    if any(part in IGNORED_WORKSPACE_PARTS for part in rel.parts):
+        return None
+    dst = _safe_destination(Path(job_input_root) / rel)
     dst.parent.mkdir(parents=True, exist_ok=True)
-
-    if dst.exists():
-        stem = dst.stem
-        suffix = dst.suffix
-        counter = 1
-        while True:
-            candidate = dst.with_name(f"{stem}_{counter}{suffix}")
-            if not candidate.exists():
-                dst = candidate
-                break
-            counter += 1
-
     shutil.move(str(input_file), str(dst))
     return dst
 
 
-def move_input_to_complete(input_file: Path, input_root: Path) -> Path | None:
-    return _move_input_to_bucket(input_file, input_root, "complete")
-
-
 def move_input_to_failed(input_file: Path, input_root: Path) -> Path | None:
-    return _move_input_to_bucket(input_file, input_root, "failed")
+    rel = _relative_source(input_file, input_root)
+    if rel is None:
+        return None
+    if any(part in {"jobs", "failed"} for part in rel.parts):
+        return None
+    failed_root = input_root.parent / "failed" if input_root.name == "input" else input_root / "failed"
+    dst = _safe_destination(failed_root / rel)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(input_file), str(dst))
+    return dst
