@@ -13,7 +13,7 @@ from imagehandler.batch import (
     relative_output_dir,
 )
 from imagehandler.extract_items import extract_items
-from imagehandler.fallback import extract_items_with_retry
+from imagehandler.fallback import extract_items_with_fallback
 from imagehandler.workspace import resolve_output_for_task
 
 from .common import print_batch_result, print_fallback_summary, print_job_paths, print_operation_report
@@ -42,20 +42,10 @@ def extract_cmd(
 ):
     out_dir, job_paths = resolve_output_for_task("items", input_path, output_dir, workspace, job)
     if retry_on_fail:
-        report, summary = extract_items_with_retry(
+        report, summary = extract_items_with_fallback(
             input_path=input_path,
             output_dir=out_dir,
-            padding=padding,
-            min_area=min_area,
-            merge_distance=merge_distance,
-            square_canvas=square_canvas,
-            normalize=normalize_size,
-            transparent_bg=transparent_bg,
-            threshold=threshold,
-            debug=debug,
-            accept_verdict=accept_verdict,
             min_score=min_score,
-            min_count=min_count,
         )
         print_operation_report(report)
         print_fallback_summary(summary)
@@ -111,7 +101,7 @@ def batch_extract_cmd(
             dst_dir = relative_output_dir(src, root, output_dir)
         try:
             if retry_on_fail:
-                extract_items_with_retry(src, dst_dir, padding=padding, min_area=min_area, merge_distance=merge_distance, square_canvas=square_canvas, normalize=normalize_size, transparent_bg=transparent_bg, threshold=threshold, debug=debug, min_count=min_count)
+                extract_items_with_fallback(src, dst_dir, min_score=85.0)
             else:
                 extract_items(src, dst_dir, padding=padding, min_area=min_area, merge_distance=merge_distance, square_canvas=square_canvas, normalize=normalize_size, transparent_bg=transparent_bg, threshold=threshold, debug=debug)
             result.succeeded += 1
