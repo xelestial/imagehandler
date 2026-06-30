@@ -9,6 +9,38 @@ log() { printf '\033[1;34m[run]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*"; }
 fail() { printf '\033[1;31m[error]\033[0m %s\n' "$*" >&2; exit 1; }
 
+python_ok() {
+  "$1" - <<'PY' >/dev/null 2>&1
+import sys
+v = sys.version_info
+raise SystemExit(0 if ((v.major, v.minor) >= (3, 11) and (v.major, v.minor) < (3, 14)) else 1)
+PY
+}
+
+python_version_text() {
+  "$1" - <<'PY' 2>/dev/null || true
+import sys
+print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
+PY
+}
+
+archive_bad_venv_if_needed() {
+  if [[ ! -x "$VENV_DIR/bin/python" ]]; then
+    return
+  fi
+
+  if python_ok "$VENV_DIR/bin/python"; then
+    return
+  fi
+
+  local version backup
+  version="$(python_version_text "$VENV_DIR/bin/python")"
+  backup="$ROOT_DIR/.venv.invalid.$(date +%Y%m%d_%H%M%S)"
+  warn "Existing venv Python is unsupported: ${version:-unknown}. Python 3.11-3.13 is required."
+  warn "Moving bad venv to: $backup"
+  mv "$VENV_DIR" "$backup"
+}
+
 cd "$ROOT_DIR"
 
 mkdir -p \
@@ -21,8 +53,10 @@ if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
   warn "Do not run this with sudo unless you intentionally want root-owned output files."
 fi
 
+archive_bad_venv_if_needed
+
 if [[ ! -d "$VENV_DIR" ]]; then
-  warn "Virtual environment was not found: $VENV_DIR"
+  warn "Virtual environment was not found or was invalid: $VENV_DIR"
   if [[ -x "$ROOT_DIR/dependency.sh" ]]; then
     log "Running dependency.sh first..."
     "$ROOT_DIR/dependency.sh"
@@ -35,6 +69,11 @@ if [[ ! -d "$VENV_DIR" ]]; then
 fi
 
 source "$VENV_DIR/bin/activate"
+
+if ! python_ok python; then
+  version="$(python_version_text python)"
+  fail "Activated Python is unsupported: ${version:-unknown}. Run: ./dependency.sh --python 3.12"
+fi
 
 print_workspace_hint() {
   cat <<EOF
@@ -85,6 +124,11 @@ Usage:
   ./run.sh
   ./run.sh menu
   ./run.sh <imagehandler CLI args>
+
+Python requirement:
+  Python 3.11-3.13. Python 3.14 is intentionally avoided for now because some
+  image / ML wheels may lag behind new CPython releases. If an old .venv uses
+  Python 3.14, run.sh moves it aside and rebuilds through dependency.sh.
 
 Optimized workspace:
   workspace/bg/input       background-removal source images
