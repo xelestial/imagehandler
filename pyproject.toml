@@ -35,7 +35,8 @@ matting = [
   "pymatting>=1.1"
 ]
 head = [
-  "mediapipe>=0.10.14"
+  "mediapipe>=0.10.14",
+  "onnxruntime>=1.17"
 ]
 dev = [
   "pytest>=8.0",
