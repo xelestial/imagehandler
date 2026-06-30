@@ -36,6 +36,9 @@ def remove_cmd(
     retry_on_fail: bool = typer.Option(False, help="Try fallback backends if quality check fails."),
     accept_verdict: str = typer.Option("PASS", help="PASS or WARN."),
     min_score: float = typer.Option(85.0, help="Minimum accepted quality score."),
+    head_refine: bool = typer.Option(True, "--head-refine/--no-head-refine", help="Enable face/head-local refinement. Default: on."),
+    bisenet_onnx: Optional[Path] = typer.Option(None, "--bisenet-onnx", help="Optional BiSeNet face-parsing ONNX model path."),
+    head_debug: bool = typer.Option(False, "--head-debug", help="Write head-refinement debug sidecar images."),
 ):
     output_path, job_paths = resolve_output_for_task("bg", input_path, output, workspace, job)
     if retry_on_fail:
@@ -50,6 +53,9 @@ def remove_cmd(
             feather=feather,
             accept_verdict=accept_verdict,
             min_score=min_score,
+            head_refine=head_refine,
+            bisenet_onnx=bisenet_onnx,
+            head_debug=head_debug,
         )
         print_operation_report(report)
         print_fallback_summary(summary)
@@ -64,6 +70,9 @@ def remove_cmd(
         mask_only=mask_only,
         postprocess=not no_postprocess,
         feather=feather,
+        head_refine=head_refine,
+        bisenet_onnx=bisenet_onnx,
+        head_debug=head_debug,
     )
     print_operation_report(report)
     print_job_paths(job_paths)
@@ -80,6 +89,9 @@ def batch_remove_cmd(
     model: Optional[str] = typer.Option(None),
     alpha_matting: bool = typer.Option(False),
     retry_on_fail: bool = typer.Option(False),
+    head_refine: bool = typer.Option(True, "--head-refine/--no-head-refine", help="Enable face/head-local refinement. Default: on."),
+    bisenet_onnx: Optional[Path] = typer.Option(None, "--bisenet-onnx", help="Optional BiSeNet face-parsing ONNX model path."),
+    head_debug: bool = typer.Option(False, "--head-debug", help="Write head-refinement debug sidecar images."),
     continue_on_error: bool = typer.Option(True, help="Keep processing after a failed file."),
 ):
     files = iter_image_files(input_path, recursive=recursive, pattern=pattern)
@@ -98,9 +110,27 @@ def batch_remove_cmd(
         dst.parent.mkdir(parents=True, exist_ok=True)
         try:
             if retry_on_fail:
-                remove_background_with_fallback(src, dst, backend=backend, model=model, alpha_matting=alpha_matting)
+                remove_background_with_fallback(
+                    src,
+                    dst,
+                    backend=backend,
+                    model=model,
+                    alpha_matting=alpha_matting,
+                    head_refine=head_refine,
+                    bisenet_onnx=bisenet_onnx,
+                    head_debug=head_debug,
+                )
             else:
-                remove_background(src, dst, backend=backend, model=model, alpha_matting=alpha_matting)
+                remove_background(
+                    src,
+                    dst,
+                    backend=backend,
+                    model=model,
+                    alpha_matting=alpha_matting,
+                    head_refine=head_refine,
+                    bisenet_onnx=bisenet_onnx,
+                    head_debug=head_debug,
+                )
             result.succeeded += 1
             result.outputs.append(str(dst))
             if job_paths is not None:
