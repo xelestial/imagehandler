@@ -12,7 +12,7 @@ from imagehandler.batch import (
     move_input_to_job_input,
     relative_output_dir,
 )
-from imagehandler.fallback import split_sheet_with_retry
+from imagehandler.fallback import split_sheet_with_fallback
 from imagehandler.split_sheet import split_sheet
 from imagehandler.workspace import resolve_output_for_task
 
@@ -40,17 +40,10 @@ def split_cmd(
 ):
     out_dir, job_paths = resolve_output_for_task("sheets", input_path, output_dir, workspace, job)
     if retry_on_fail:
-        report, summary = split_sheet_with_retry(
+        report, summary = split_sheet_with_fallback(
             input_path=input_path,
             output_dir=out_dir,
             views=views,
-            padding=padding,
-            min_area=min_area,
-            merge_distance=merge_distance,
-            normalize=normalize_size,
-            threshold=threshold,
-            debug=debug,
-            accept_verdict=accept_verdict,
             min_score=min_score,
         )
         print_operation_report(report)
@@ -104,7 +97,7 @@ def batch_split_cmd(
             dst_dir = relative_output_dir(src, root, output_dir)
         try:
             if retry_on_fail:
-                split_sheet_with_retry(src, dst_dir, views=views, padding=padding, min_area=min_area, merge_distance=merge_distance, normalize=normalize_size, threshold=threshold, debug=debug)
+                split_sheet_with_fallback(src, dst_dir, views=views, min_score=85.0)
             else:
                 split_sheet(src, dst_dir, views=views, padding=padding, min_area=min_area, merge_distance=merge_distance, normalize=normalize_size, threshold=threshold, debug=debug)
             result.succeeded += 1
