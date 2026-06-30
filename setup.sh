@@ -38,8 +38,7 @@ usage() {
   cat <<'USAGE'
 Usage: ./setup.sh [options]
 
-Single installer for ImageHandler. This replaces the old split between
-setup.sh and dependency.sh.
+Single installer for ImageHandler. dependency.sh is only a compatibility wrapper.
 
 Options:
   --python 3.14      Preferred Python version or executable. Default: auto.
@@ -57,7 +56,9 @@ Options:
   -h, --help         Show this help.
 
 Python policy:
-  Python 3.11 through 3.14 is accepted. Existing .venv/bin/python is used first.
+  Python 3.11 through 3.14 is accepted.
+  If --python is given, an existing .venv with a different Python minor version
+  is not reused; it is moved aside and recreated.
 
 Recommended:
   ./setup.sh
@@ -124,7 +125,31 @@ print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micr
 PY
 }
 
+python_minor_text() {
+  "$1" - <<'PY' 2>/dev/null || true
+import sys
+print(f"{sys.version_info.major}.{sys.version_info.minor}")
+PY
+}
+
+preferred_is_version() {
+  [[ -n "$PREFERRED_PYTHON" && "$PREFERRED_PYTHON" != */* ]]
+}
+
+python_matches_preferred() {
+  local py="$1"
+  [[ -z "$PREFERRED_PYTHON" ]] && return 0
+
+  if [[ "$PREFERRED_PYTHON" == */* ]]; then
+    [[ "$py" == "$PREFERRED_PYTHON" ]] && return 0
+    return 1
+  fi
+
+  [[ "$(python_minor_text "$py")" == "$PREFERRED_PYTHON" ]]
+}
+
 resolve_python_bin_file() {
+  [[ -z "$PREFERRED_PYTHON" ]] || return 1
   if [[ ! -f "$PYTHON_BIN_FILE" ]]; then
     return 1
   fi
@@ -139,17 +164,20 @@ resolve_python_bin_file() {
 }
 
 find_python() {
-  if [[ "$USE_VENV" -eq 1 && -x "$VENV_DIR/bin/python" ]] && python_version_ok "$VENV_DIR/bin/python"; then
+  # If --python is not specified, existing venv is the source of truth.
+  if [[ -z "$PREFERRED_PYTHON" && "$USE_VENV" -eq 1 && -x "$VENV_DIR/bin/python" ]] && python_version_ok "$VENV_DIR/bin/python"; then
     printf '%s\n' "$VENV_DIR/bin/python"
     return
   fi
 
   if [[ -n "$PYTHON_BIN" ]]; then
     if ([[ -x "$PYTHON_BIN" ]] || command -v "$PYTHON_BIN" >/dev/null 2>&1) && python_version_ok "$PYTHON_BIN"; then
-      command -v "$PYTHON_BIN" 2>/dev/null || printf '%s\n' "$PYTHON_BIN"
-      return
+      if python_matches_preferred "$PYTHON_BIN"; then
+        command -v "$PYTHON_BIN" 2>/dev/null || printf '%s\n' "$PYTHON_BIN"
+        return
+      fi
     fi
-    fail "PYTHON_BIN is not a supported Python 3.11-3.14 executable: $PYTHON_BIN"
+    fail "PYTHON_BIN is not a matching supported Python executable: $PYTHON_BIN"
   fi
 
   if resolve_python_bin_file; then
@@ -161,18 +189,21 @@ find_python() {
     if [[ "$PREFERRED_PYTHON" == */* ]]; then
       candidates+=("$PREFERRED_PYTHON")
     else
-      candidates+=("python${PREFERRED_PYTHON}")
+      candidates+=("python${PREFERRED_PYTHON}" "/usr/local/bin/python${PREFERRED_PYTHON}" "/opt/homebrew/bin/python${PREFERRED_PYTHON}")
     fi
+  else
+    candidates+=(python3.14 python3.13 python3.12 python3.11 python3 python)
+    candidates+=(/usr/local/bin/python3.14 /usr/local/bin/python3.13 /usr/local/bin/python3.12 /usr/local/bin/python3.11)
+    candidates+=(/opt/homebrew/bin/python3.14 /opt/homebrew/bin/python3.13 /opt/homebrew/bin/python3.12 /opt/homebrew/bin/python3.11)
   fi
-  candidates+=(python3.14 python3.13 python3.12 python3.11 python3 python)
-  candidates+=(/usr/local/bin/python3.14 /usr/local/bin/python3.13 /usr/local/bin/python3.12 /usr/local/bin/python3.11)
-  candidates+=(/opt/homebrew/bin/python3.14 /opt/homebrew/bin/python3.13 /opt/homebrew/bin/python3.12 /opt/homebrew/bin/python3.11)
 
   local p
   for p in "${candidates[@]}"; do
     if ([[ -x "$p" ]] || command -v "$p" >/dev/null 2>&1) && python_version_ok "$p"; then
-      command -v "$p" 2>/dev/null || printf '%s\n' "$p"
-      return
+      if python_matches_preferred "$p"; then
+        command -v "$p" 2>/dev/null || printf '%s\n' "$p"
+        return
+      fi
     fi
   done
 }
@@ -189,18 +220,31 @@ install_linux_runtime_deps() {
     libgl1 libglib2.0-0 libsm6 libxext6 libxrender1
 }
 
-archive_bad_venv_if_needed() {
+archive_venv() {
+  if [[ ! -d "$VENV_DIR" ]]; then
+    return
+  fi
+  local backup
+  backup="$ROOT_DIR/.venv.invalid.$(date +%Y%m%d_%H%M%S)"
+  warn "Moving existing venv to: $backup"
+  mv "$VENV_DIR" "$backup"
+}
+
+archive_bad_or_mismatched_venv_if_needed() {
   if [[ ! -x "$VENV_DIR/bin/python" ]]; then
     return
   fi
-  if python_version_ok "$VENV_DIR/bin/python"; then
+
+  if ! python_version_ok "$VENV_DIR/bin/python"; then
+    warn "Existing venv Python is unsupported: $(python_version_text "$VENV_DIR/bin/python")"
+    archive_venv
     return
   fi
-  local version backup
-  version="$(python_version_text "$VENV_DIR/bin/python")"
-  backup="$ROOT_DIR/.venv.invalid.$(date +%Y%m%d_%H%M%S)"
-  warn "Existing venv Python is unsupported: ${version:-unknown}. Moving it to $backup"
-  mv "$VENV_DIR" "$backup"
+
+  if [[ -n "$PREFERRED_PYTHON" ]] && ! python_matches_preferred "$VENV_DIR/bin/python"; then
+    warn "Existing venv Python $(python_minor_text "$VENV_DIR/bin/python") does not match requested --python $PREFERRED_PYTHON"
+    archive_venv
+  fi
 }
 
 log "Detected OS: $OS_NAME / $ARCH_NAME"
@@ -213,11 +257,16 @@ if [[ "$IS_MAC" -eq 1 && "$MODE" == "gpu" ]]; then
   MODE="cpu"
 fi
 
-archive_bad_venv_if_needed
+archive_bad_or_mismatched_venv_if_needed
 install_linux_runtime_deps || warn "Linux runtime dependency install skipped or failed; continuing."
 
 PY="$(find_python || true)"
-[[ -n "$PY" ]] || fail "Python 3.11-3.14 was not found. Install Python or run with --python /path/to/python."
+if [[ -z "$PY" ]]; then
+  if [[ -n "$PREFERRED_PYTHON" ]]; then
+    fail "Requested Python $PREFERRED_PYTHON was not found. Use ./setup.sh with no --python to use an available Python, or install python$PREFERRED_PYTHON."
+  fi
+  fail "Python 3.11-3.14 was not found. Install Python or run with --python /path/to/python."
+fi
 
 log "Using Python: $PY ($(python_version_text "$PY"))"
 printf '%s\n' "$PY" > "$PYTHON_BIN_FILE"
@@ -238,7 +287,10 @@ if [[ "$USE_VENV" -eq 1 ]]; then
       log "Creating virtual environment: $VENV_DIR"
       "$PY" -m venv "$VENV_DIR"
     else
-      log "Using existing virtual environment: $VENV_DIR"
+      warn "Existing venv directory remains but was not selected. Recreating it."
+      archive_venv
+      log "Creating virtual environment: $VENV_DIR"
+      "$PY" -m venv "$VENV_DIR"
     fi
   fi
   source "$VENV_DIR/bin/activate"
