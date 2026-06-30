@@ -6,13 +6,13 @@ from pathlib import Path
 import numpy as np
 from PIL import Image, ImageFilter
 
+from .alpha_quality import alpha_quality_metrics, save_alpha_previews
 from .bg_refine import (
     decontaminate_edge_rgb,
     refine_foreground_mask_against_background,
     smooth_alpha_edges,
     zero_transparent_rgb,
 )
-from .debug import save_mask
 from .io import load_image, sidecar_path
 from .mask_ops import (
     apply_mask_as_alpha,
@@ -64,13 +64,15 @@ def remove_background(
 
     if selected_backend == "rembg":
         rembg_model = normalize_rembg_model(model)
-        rgba, soft_alpha = _remove_with_rembg(source_image, model=rembg_model, alpha_matting=alpha_matting)
+        rgba, soft_alpha = _remove_with_rembg(
+            source_image, model=rembg_model, alpha_matting=alpha_matting
+        )
         backend_label = f"rembg:{rembg_model}"
     elif selected_backend == "transparent":
         rgba, soft_alpha = _remove_with_transparent_background(source_image)
     elif selected_backend == "classical":
         support_mask = foreground_mask_from_background(source_image)
-        soft_alpha = (support_mask.astype(np.uint8) * 255)
+        soft_alpha = support_mask.astype(np.uint8) * 255
         rgba = apply_mask_as_alpha(source_image, support_mask)
     else:
         raise ValueError(f"Unknown backend: {backend}")
@@ -103,12 +105,25 @@ def remove_background(
     mask = soft_alpha > 8
 
     metrics = mask_metrics(mask)
+    alpha_metrics = alpha_quality_metrics(rgba)
+    metrics.update(alpha_metrics)
+
     if metrics["foreground_area_ratio"] < 0.005:
         warnings.append("Foreground mask is extremely small.")
     if metrics["foreground_area_ratio"] > 0.98:
         warnings.append("Foreground mask covers almost the entire image.")
     if metrics["touches_border"]:
         warnings.append("Foreground touches image border; crop may be incomplete.")
+    if alpha_metrics["transparent_rgb_leak_ratio"] > 0.001:
+        warnings.append("Transparent pixels still contain RGB values; this can cause halos.")
+    if alpha_metrics["alpha_unique_levels"] < 16 and alpha_metrics["semi_alpha_ratio"] > 0:
+        warnings.append("Alpha matte has very few levels; edge may be too binary.")
+    if alpha_metrics["edge_jaggedness_ratio"] > 1.18:
+        warnings.append("Detected jagged alpha edge; silhouette may need refinement.")
+    if alpha_metrics["semi_dark_rgb_ratio"] > 0.35:
+        warnings.append("Many semi-transparent edge pixels are very dark; black halo may appear in previews.")
+    if alpha_metrics["semi_light_rgb_ratio"] > 0.45:
+        warnings.append("Many semi-transparent edge pixels are very light; white halo may appear in previews.")
 
     mask_path = sidecar_path(output, ".mask")
     report_path = output.with_name(f"{output.stem}.report.json")
@@ -119,7 +134,8 @@ def remove_background(
     else:
         rgba.save(output)
         _save_alpha_matte(soft_alpha, mask_path)
-        outputs = [str(output), str(mask_path)]
+        preview_outputs = save_alpha_previews(rgba, output)
+        outputs = [str(output), str(mask_path), *preview_outputs]
 
     bbox = bbox_from_mask(mask)
     report = OperationReport(
