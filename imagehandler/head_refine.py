@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import cv2
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from .mask_ops import estimate_background_rgb, pil_to_rgba_array
 
@@ -20,10 +21,11 @@ _BISENET_HEAD_KEEP_LABELS = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 
 _BISENET_BG_LABEL = 0
 
 
-@dataclass(frozen=True)
+@dataclass
 class HeadRefineResult:
     alpha: np.ndarray
     metrics: dict[str, Any]
+    debug_images: dict[str, Image.Image] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -57,6 +59,7 @@ def refine_head_alpha_with_face_priority(
     bg_threshold: float = 30.0,
     max_removed_roi_ratio: float = 0.035,
     bisenet_onnx_path: str | Path | None = None,
+    debug: bool = False,
 ) -> HeadRefineResult:
     """Refine only head/face regions, preferring face-specific models.
 
@@ -76,6 +79,10 @@ def refine_head_alpha_with_face_priority(
 
     rgba = pil_to_rgba_array(image)
     h, w = a.shape[:2]
+    before_alpha = a.copy() if debug else None
+    removed_total_mask = np.zeros_like(a, dtype=np.uint8) if debug else None
+    parser_label_canvas = np.zeros_like(a, dtype=np.uint8) if debug else None
+
     rois, detector = _detect_head_rois(image, a)
     parser = _load_bisenet_session(bisenet_onnx_path)
     parser_state = "bisenet_onnx" if parser is not None else "none"
@@ -102,14 +109,19 @@ def refine_head_alpha_with_face_priority(
         local_rgba = rgba[roi.top : roi.bottom, roi.left : roi.right]
 
         removed: np.ndarray | None = None
+        labels: np.ndarray | None = None
         if parser is not None:
-            removed = _remove_bisenet_background_in_roi(
+            parsed = _remove_bisenet_background_in_roi(
                 parser=parser,
                 local_rgba=local_rgba,
                 local_alpha=local_alpha,
                 bg_threshold=bg_threshold,
                 max_removed_roi_ratio=max_removed_roi_ratio,
             )
+            if parsed is not None:
+                removed, labels = parsed
+                if labels is not None and parser_label_canvas is not None:
+                    parser_label_canvas[roi.top : roi.bottom, roi.left : roi.right] = labels.astype(np.uint8)
             if removed is not None and removed.any():
                 parser_applied += 1
 
@@ -130,8 +142,21 @@ def refine_head_alpha_with_face_priority(
         if removed_count <= 0:
             continue
         local_alpha[removed] = 0
+        if removed_total_mask is not None:
+            removed_total_mask[roi.top : roi.bottom, roi.left : roi.right][removed] = 255
         total_removed += removed_count
         applied_rois.append(roi.to_list())
+
+    debug_images: dict[str, Image.Image] = {}
+    if debug:
+        if before_alpha is not None:
+            debug_images["head.before"] = Image.fromarray(before_alpha, mode="L")
+        debug_images["head.after"] = Image.fromarray(a, mode="L")
+        if removed_total_mask is not None:
+            debug_images["head.removed"] = Image.fromarray(removed_total_mask, mode="L")
+        if parser_label_canvas is not None and parser_label_canvas.max() > 0:
+            debug_images["head.labels"] = _label_preview(parser_label_canvas)
+        debug_images["head.roi"] = _roi_overlay(image, rois, applied_rois)
 
     return HeadRefineResult(
         a,
@@ -140,6 +165,7 @@ def refine_head_alpha_with_face_priority(
             "head_refine_detector": detector,
             "head_refine_parser": parser_state,
             "head_refine_bisenet_model": str(_resolve_bisenet_path(bisenet_onnx_path) or ""),
+            "head_refine_debug": bool(debug),
             "head_refine_roi_count": len(rois),
             "head_refine_applied_roi_count": len(applied_rois),
             "head_refine_skipped_roi_count": skipped,
@@ -151,6 +177,7 @@ def refine_head_alpha_with_face_priority(
             "head_refine_rois": [r.to_list() for r in rois],
             "head_refine_applied_rois": applied_rois,
         },
+        debug_images,
     )
 
 
@@ -160,6 +187,7 @@ def _empty_metrics(enabled: bool, detector: str) -> dict[str, Any]:
         "head_refine_detector": detector,
         "head_refine_parser": "none",
         "head_refine_bisenet_model": "",
+        "head_refine_debug": False,
         "head_refine_roi_count": 0,
         "head_refine_applied_roi_count": 0,
         "head_refine_skipped_roi_count": 0,
@@ -215,8 +243,8 @@ def _mediapipe_face_rois(image: Image.Image) -> list[Roi]:
         fw = max(1.0, x2 - x1)
         fh = max(1.0, y2 - y1)
 
-        # Narrower than the previous version. The bottom is intentionally only a
-        # small extension below the face to avoid shoulders, sleeves, and chest.
+        # Narrower than the first implementation. The bottom is intentionally
+        # only a small extension below the face to avoid shoulders and sleeves.
         left = int(max(0, x1 - fw * 0.85))
         right = int(min(w, x2 + fw * 0.85))
         top = int(max(0, y1 - fh * 1.30))
@@ -267,12 +295,17 @@ def _load_bisenet_session(path: str | Path | None):
     model_path = _resolve_bisenet_path(path)
     if model_path is None:
         return None
+    return _load_bisenet_session_cached(str(model_path))
+
+
+@lru_cache(maxsize=4)
+def _load_bisenet_session_cached(model_path: str):
     try:
         import onnxruntime as ort  # type: ignore
     except Exception:
         return None
     try:
-        return ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+        return ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
     except Exception:
         return None
 
@@ -283,7 +316,7 @@ def _remove_bisenet_background_in_roi(
     local_alpha: np.ndarray,
     bg_threshold: float,
     max_removed_roi_ratio: float,
-) -> np.ndarray | None:
+) -> tuple[np.ndarray, np.ndarray | None] | None:
     label_map = _run_bisenet(parser, local_rgba)
     if label_map is None:
         return None
@@ -301,14 +334,15 @@ def _remove_bisenet_background_in_roi(
     connected = _border_connected(bg & bg_like)
     removable = connected & (local_alpha > 8)
     if not removable.any():
-        return removable
+        return removable, label_map
 
     removed_ratio = float(removable.sum() / max(1, h * w))
     if removed_ratio > float(max_removed_roi_ratio):
         return None
 
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    return cv2.morphologyEx(removable.astype(np.uint8), cv2.MORPH_OPEN, kernel) > 0
+    removable = cv2.morphologyEx(removable.astype(np.uint8), cv2.MORPH_OPEN, kernel) > 0
+    return removable, label_map
 
 
 def _run_bisenet(parser: Any, local_rgba: np.ndarray) -> np.ndarray | None:
@@ -385,6 +419,33 @@ def _background_like_neutral(local_rgba: np.ndarray, bg_threshold: float) -> np.
     min_rgb = local_rgba[:, :, :3].min(axis=2).astype(np.int16)
     chroma = max_rgb - min_rgb
     return (distance <= float(bg_threshold)) & (chroma <= 30)
+
+
+def _roi_overlay(image: Image.Image, rois: list[Roi], applied_rois: list[list[int | str]]) -> Image.Image:
+    out = image.convert("RGB")
+    draw = ImageDraw.Draw(out)
+    applied_keys = {tuple(item[:4]) for item in applied_rois}
+    for roi in rois:
+        box = (roi.left, roi.top, roi.right, roi.bottom)
+        applied = (roi.left, roi.top, roi.right, roi.bottom) in applied_keys
+        color = (255, 64, 64) if applied else (255, 220, 0)
+        draw.rectangle(box, outline=color, width=3)
+        draw.text((roi.left, max(0, roi.top - 12)), roi.method, fill=color)
+    return out
+
+
+def _label_preview(labels: np.ndarray) -> Image.Image:
+    labels = labels.astype(np.uint8)
+    palette = np.array(
+        [
+            [0, 0, 0], [255, 220, 177], [255, 128, 0], [255, 160, 0], [0, 180, 255],
+            [0, 120, 255], [100, 100, 100], [255, 210, 160], [255, 200, 150], [200, 160, 80],
+            [255, 80, 100], [200, 60, 90], [255, 100, 140], [220, 80, 120], [180, 140, 100],
+            [120, 100, 80], [80, 120, 255], [40, 40, 40], [120, 80, 180],
+        ],
+        dtype=np.uint8,
+    )
+    return Image.fromarray(palette[labels % len(palette)], mode="RGB")
 
 
 def _dedupe_rois(rois: list[Roi]) -> list[Roi]:
