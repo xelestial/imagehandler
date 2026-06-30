@@ -13,7 +13,7 @@ python_ok() {
   "$1" - <<'PY' >/dev/null 2>&1
 import sys
 v = sys.version_info
-raise SystemExit(0 if ((v.major, v.minor) >= (3, 11) and (v.major, v.minor) < (3, 14)) else 1)
+raise SystemExit(0 if ((v.major, v.minor) >= (3, 11) and (v.major, v.minor) < (3, 15)) else 1)
 PY
 }
 
@@ -36,7 +36,7 @@ archive_bad_venv_if_needed() {
   local version backup
   version="$(python_version_text "$VENV_DIR/bin/python")"
   backup="$ROOT_DIR/.venv.invalid.$(date +%Y%m%d_%H%M%S)"
-  warn "Existing venv Python is unsupported: ${version:-unknown}. Python 3.11-3.13 is required."
+  warn "Existing venv Python is unsupported: ${version:-unknown}. Python 3.11-3.14 is required."
   warn "Moving bad venv to: $backup"
   mv "$VENV_DIR" "$backup"
 }
@@ -57,14 +57,11 @@ archive_bad_venv_if_needed
 
 if [[ ! -d "$VENV_DIR" ]]; then
   warn "Virtual environment was not found or was invalid: $VENV_DIR"
-  if [[ -x "$ROOT_DIR/dependency.sh" ]]; then
-    log "Running dependency.sh first..."
-    "$ROOT_DIR/dependency.sh"
-  elif [[ -f "$ROOT_DIR/dependency.sh" ]]; then
-    log "Running dependency.sh first through bash..."
-    bash "$ROOT_DIR/dependency.sh"
+  if [[ -x "$ROOT_DIR/setup.sh" ]]; then
+    log "Running setup.sh first..."
+    "$ROOT_DIR/setup.sh"
   else
-    fail "dependency.sh not found. Run setup first."
+    fail "setup.sh not found. Run setup first."
   fi
 fi
 
@@ -72,7 +69,7 @@ source "$VENV_DIR/bin/activate"
 
 if ! python_ok python; then
   version="$(python_version_text python)"
-  fail "Activated Python is unsupported: ${version:-unknown}. Run: ./dependency.sh --python 3.12"
+  fail "Activated Python is unsupported: ${version:-unknown}. Run: ./setup.sh"
 fi
 
 print_workspace_hint() {
@@ -126,9 +123,7 @@ Usage:
   ./run.sh <imagehandler CLI args>
 
 Python requirement:
-  Python 3.11-3.13. Python 3.14 is intentionally avoided for now because some
-  image / ML wheels may lag behind new CPython releases. If an old .venv uses
-  Python 3.14, run.sh moves it aside and rebuilds through dependency.sh.
+  Python 3.11-3.14.
 
 Optimized workspace:
   workspace/bg/input       background-removal source images
