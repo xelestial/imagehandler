@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -64,14 +63,14 @@ def refine_head_alpha_with_face_priority(
     """Refine only head/face regions, preferring face-specific models.
 
     Priority:
-      1. BiSeNet face parsing ONNX, when a model path is configured and
+      1. BiSeNet face parsing ONNX, when a model path is explicitly supplied and
          MediaPipe FaceMesh provides a face/head ROI.
       2. MediaPipe FaceMesh ROI with conservative connected-background cleanup.
       3. Heuristic component-top ROI is metrics-only and never deletes alpha.
 
-    This deliberately avoids destructive cleanup for heuristic ROIs. Previous
-    heuristic fallback could enter shoulders/sleeves on multi-character sheets
-    and punch holes in white clothing.
+    The BiSeNet model path is intentionally supplied by the caller. This module
+    does not read environment variables; menu/config decides whether a model is
+    available and should be used.
     """
     a = np.asarray(alpha).astype(np.uint8).copy()
     if not enabled or a.size == 0 or a.max() == 0:
@@ -98,9 +97,6 @@ def refine_head_alpha_with_face_priority(
         if roi.area <= 0:
             continue
 
-        # Critical safety rule: heuristic ROI is not allowed to delete pixels.
-        # It is too broad for multi-character costume sheets and can damage
-        # sleeves, collars, capes, and white ornaments.
         if roi.method != "mediapipe_facemesh":
             heuristic_metrics_only += 1
             continue
@@ -205,7 +201,6 @@ def _detect_head_rois(image: Image.Image, alpha: np.ndarray) -> tuple[list[Roi],
     rois = _mediapipe_face_rois(image)
     if rois:
         return rois, "mediapipe_facemesh"
-    # Fallback is kept for diagnostics only. It must not delete alpha.
     return _heuristic_head_rois(alpha), "heuristic_component_top_metrics_only"
 
 
@@ -243,8 +238,6 @@ def _mediapipe_face_rois(image: Image.Image) -> list[Roi]:
         fw = max(1.0, x2 - x1)
         fh = max(1.0, y2 - y1)
 
-        # Narrower than the first implementation. The bottom is intentionally
-        # only a small extension below the face to avoid shoulders and sleeves.
         left = int(max(0, x1 - fw * 0.85))
         right = int(min(w, x2 + fw * 0.85))
         top = int(max(0, y1 - fh * 1.30))
@@ -284,7 +277,7 @@ def _heuristic_head_rois(alpha: np.ndarray) -> list[Roi]:
 
 
 def _resolve_bisenet_path(path: str | Path | None) -> Path | None:
-    raw = str(path or os.environ.get("IMAGEHANDLER_BISENET_ONNX", "")).strip()
+    raw = str(path or "").strip()
     if not raw:
         return None
     p = Path(raw).expanduser()
@@ -350,7 +343,6 @@ def _run_bisenet(parser: Any, local_rgba: np.ndarray) -> np.ndarray | None:
         input_meta = parser.get_inputs()[0]
         input_name = input_meta.name
         shape = list(input_meta.shape)
-        # Most exported BiSeNet face-parsing ONNX models use NCHW.
         target_h = int(shape[2]) if len(shape) == 4 and isinstance(shape[2], int) else 512
         target_w = int(shape[3]) if len(shape) == 4 and isinstance(shape[3], int) else 512
 
@@ -362,7 +354,6 @@ def _run_bisenet(parser: Any, local_rgba: np.ndarray) -> np.ndarray | None:
         output = parser.run(None, {input_name: chw})[0]
         logits = np.asarray(output)
         if logits.ndim == 4:
-            # N,C,H,W or N,H,W,C
             if logits.shape[1] <= 64:
                 labels = logits[0].argmax(axis=0)
             else:
@@ -400,8 +391,6 @@ def _remove_connected_background_in_roi(
     if removed_ratio > float(max_removed_roi_ratio):
         return None
 
-    # Additional lower-half guard. Hair side gaps are mostly upper/mid ROI;
-    # this protects neck ornaments and collars when FaceMesh bbox is imperfect.
     yy = np.arange(h)[:, None]
     removable = removable & (yy <= int(h * 0.82))
 
