@@ -15,7 +15,15 @@ SKIP_SMOKE=0
 OS_NAME="$(uname -s 2>/dev/null || echo unknown)"
 ARCH_NAME="$(uname -m 2>/dev/null || echo unknown)"
 IS_MAC=0
+IS_LINUX=0
+IS_WSL=0
 [[ "$OS_NAME" == "Darwin" ]] && IS_MAC=1
+[[ "$OS_NAME" == "Linux" ]] && IS_LINUX=1
+if [[ "$IS_LINUX" -eq 1 ]]; then
+  if grep -qiE "microsoft|wsl" /proc/version 2>/dev/null || [[ -n "${WSL_INTEROP:-}" ]] || [[ -n "${WSL_DISTRO_NAME:-}" ]]; then
+    IS_WSL=1
+  fi
+fi
 
 log() { printf '\033[1;34m[setup]\033[0m %s\n' "$*"; }
 warn() { printf '\033[1;33m[warn]\033[0m %s\n' "$*"; }
@@ -36,6 +44,10 @@ Options:
   --skip-smoke       Skip smoke tests after installation.
   --workspace DIR    Create optimized workspace folders under DIR. Default: ./workspace
   -h, --help         Show this help.
+
+Python requirement:
+  Python 3.11-3.13. Python 3.14 is intentionally avoided for now because some
+  image / ML wheels may lag behind new CPython releases.
 
 Optimized workspace:
   workspace/bg/input
@@ -89,6 +101,9 @@ done
 cd "$ROOT_DIR"
 
 log "Detected OS: $OS_NAME / $ARCH_NAME"
+if [[ "$IS_WSL" -eq 1 ]]; then
+  log "WSL detected"
+fi
 if [[ "$IS_MAC" -eq 1 && "$MODE" == "gpu" ]]; then
   warn "macOS does not use the rembg NVIDIA/CUDA GPU path. Falling back to --cpu."
   MODE="cpu"
@@ -102,19 +117,27 @@ raise SystemExit(0 if ((v.major, v.minor) >= (3, 11) and (v.major, v.minor) < (3
 PY
 }
 
+python_version_text() {
+  "$1" - <<'PY' 2>/dev/null || true
+import sys
+print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
+PY
+}
+
 find_python() {
   if [[ -n "$PYTHON_BIN" ]]; then
     command -v "$PYTHON_BIN" >/dev/null 2>&1 || fail "PYTHON_BIN not found: $PYTHON_BIN"
-    python_version_ok "$PYTHON_BIN" || fail "PYTHON_BIN must be Python >=3.11 and <3.14: $PYTHON_BIN"
+    python_version_ok "$PYTHON_BIN" || fail "PYTHON_BIN must be Python >=3.11 and <3.14: $PYTHON_BIN ($(python_version_text "$PYTHON_BIN"))"
     printf '%s\n' "$PYTHON_BIN"
     return
   fi
 
   local candidates=(
-    python3.13 python3.12 python3.11 python3 python
-    /opt/homebrew/bin/python3.13 /opt/homebrew/bin/python3.12 /opt/homebrew/bin/python3.11 /opt/homebrew/bin/python3
+    python3.13 python3.12 python3.11
+    /opt/homebrew/bin/python3.13 /opt/homebrew/bin/python3.12 /opt/homebrew/bin/python3.11
     /opt/homebrew/opt/python@3.13/bin/python3.13 /opt/homebrew/opt/python@3.12/bin/python3.12 /opt/homebrew/opt/python@3.11/bin/python3.11
-    /usr/local/bin/python3.13 /usr/local/bin/python3.12 /usr/local/bin/python3.11 /usr/local/bin/python3
+    /usr/local/bin/python3.13 /usr/local/bin/python3.12 /usr/local/bin/python3.11
+    python3 python
   )
   local candidate
   for candidate in "${candidates[@]}"; do
@@ -124,13 +147,31 @@ find_python() {
     fi
   done
 
-  fail "Python 3.11-3.13 was not found. On macOS run: brew install python@3.12"
+  fail "Python 3.11-3.13 was not found. If python3 is 3.14, run ./dependency.sh --python 3.12 to install/use a supported version."
+}
+
+archive_bad_venv_if_needed() {
+  if [[ ! -x "$VENV_DIR/bin/python" ]]; then
+    return
+  fi
+
+  if python_version_ok "$VENV_DIR/bin/python"; then
+    return
+  fi
+
+  local version backup
+  version="$(python_version_text "$VENV_DIR/bin/python")"
+  backup="$ROOT_DIR/.venv.invalid.$(date +%Y%m%d_%H%M%S)"
+  warn "Existing venv Python is unsupported: ${version:-unknown}. Python 3.11-3.13 is required."
+  warn "Moving bad venv to: $backup"
+  mv "$VENV_DIR" "$backup"
 }
 
 PY="$(find_python)"
-log "Using Python: $PY"
+log "Using Python: $PY ($(python_version_text "$PY"))"
 
 if [[ "$USE_VENV" -eq 1 ]]; then
+  archive_bad_venv_if_needed
   if [[ ! -d "$VENV_DIR" ]]; then
     log "Creating virtual environment: $VENV_DIR"
     "$PY" -m venv "$VENV_DIR"
@@ -139,6 +180,9 @@ if [[ "$USE_VENV" -eq 1 ]]; then
   fi
   source "$VENV_DIR/bin/activate"
   PY="python"
+  python_version_ok "$PY" || fail "Activated venv Python is unsupported: $(python_version_text "$PY")"
+else
+  log "Using current Python environment without creating venv"
 fi
 
 log "Upgrading packaging tools"
