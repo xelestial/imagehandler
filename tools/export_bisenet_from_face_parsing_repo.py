@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -36,9 +37,10 @@ def main() -> int:
         description=(
             "Export BiSeNet face-parsing checkpoint to ONNX. "
             "Run this script from inside a local face-parsing.PyTorch checkout, "
-            "or copy it into that checkout root so model.py is importable."
+            "or pass --source-repo to the checkout root."
         )
     )
+    parser.add_argument("--source-repo", type=Path, default=Path.cwd(), help="face-parsing.PyTorch checkout root containing model.py. Default: current directory")
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=Path("models/bisenet_face_parsing.onnx"))
     parser.add_argument("--input-size", type=int, default=512)
@@ -46,6 +48,12 @@ def main() -> int:
     parser.add_argument("--opset", type=int, default=17)
     parser.add_argument("--meta", type=Path, default=Path("models/bisenet_face_parsing.onnx.json"))
     args = parser.parse_args()
+
+    source_repo = args.source_repo.expanduser().resolve()
+    model_py = source_repo / "model.py"
+    if not model_py.is_file():
+        raise FileNotFoundError(f"model.py not found in source repo: {source_repo}")
+    sys.path.insert(0, str(source_repo))
 
     import torch
     from model import BiSeNet  # type: ignore
@@ -87,6 +95,7 @@ def main() -> int:
         "output": str(args.output),
         "sha256": sha256_file(args.output),
         "size_bytes": args.output.stat().st_size,
+        "source_repo": str(source_repo),
         "checkpoint": str(args.checkpoint),
         "input_shape": [1, 3, args.input_size, args.input_size],
         "output_name": "logits",
