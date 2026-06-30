@@ -4,6 +4,8 @@ set -Eeuo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="${VENV_DIR:-$ROOT_DIR/.venv}"
 PYTHON_BIN="${PYTHON_BIN:-}"
+PYTHON_BIN_FILE="$ROOT_DIR/.python-bin"
+ENV_FILE="$ROOT_DIR/.imagehandler-env"
 WORKSPACE_DIR="${WORKSPACE_DIR:-$ROOT_DIR/workspace}"
 MODE="cpu"
 WITH_TRANSPARENT=0
@@ -45,27 +47,15 @@ Options:
   --workspace DIR    Create optimized workspace folders under DIR. Default: ./workspace
   -h, --help         Show this help.
 
+Interpreter resolution:
+  1) existing valid .venv/bin/python
+  2) .python-bin written by dependency.sh
+  3) PYTHON_BIN environment variable
+  4) PATH candidates: python3.13 / python3.12 / python3.11
+
 Python requirement:
   Python 3.11-3.13. Python 3.14 is intentionally avoided for now because some
   image / ML wheels may lag behind new CPython releases.
-
-Optimized workspace:
-  workspace/bg/input
-  workspace/bg/jobs/<job>/input
-  workspace/bg/jobs/<job>/output
-  workspace/bg/failed
-
-  workspace/sheets/input
-  workspace/sheets/jobs/<job>/input
-  workspace/sheets/jobs/<job>/output
-  workspace/sheets/failed
-
-  workspace/items/input
-  workspace/items/jobs/<job>/input
-  workspace/items/jobs/<job>/output
-  workspace/items/failed
-
-  workspace/reports
 USAGE
 }
 
@@ -124,7 +114,42 @@ print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micr
 PY
 }
 
+resolve_existing_venv_python() {
+  if [[ "$USE_VENV" -eq 1 && -x "$VENV_DIR/bin/python" ]]; then
+    if python_version_ok "$VENV_DIR/bin/python"; then
+      printf '%s\n' "$VENV_DIR/bin/python"
+      return 0
+    fi
+  fi
+  return 1
+}
+
+resolve_python_bin_file() {
+  if [[ -f "$PYTHON_BIN_FILE" ]]; then
+    local p
+    p="$(tr -d '\r\n' < "$PYTHON_BIN_FILE")"
+    if [[ -n "$p" && ( -x "$p" || $(command -v "$p" >/dev/null 2>&1; echo $?) -eq 0 ) ]]; then
+      if python_version_ok "$p"; then
+        command -v "$p" 2>/dev/null || printf '%s\n' "$p"
+        return 0
+      fi
+      warn ".python-bin points to unsupported Python: $p ($(python_version_text "$p"))"
+    fi
+  fi
+  return 1
+}
+
 find_python() {
+  # Existing venv is the source of truth. This is the whole point of venv.
+  if resolve_existing_venv_python; then
+    return
+  fi
+
+  # dependency.sh stores the interpreter used to create the venv here.
+  if resolve_python_bin_file; then
+    return
+  fi
+
   if [[ -n "$PYTHON_BIN" ]]; then
     command -v "$PYTHON_BIN" >/dev/null 2>&1 || fail "PYTHON_BIN not found: $PYTHON_BIN"
     python_version_ok "$PYTHON_BIN" || fail "PYTHON_BIN must be Python >=3.11 and <3.14: $PYTHON_BIN ($(python_version_text "$PYTHON_BIN"))"
@@ -137,7 +162,6 @@ find_python() {
     /opt/homebrew/bin/python3.13 /opt/homebrew/bin/python3.12 /opt/homebrew/bin/python3.11
     /opt/homebrew/opt/python@3.13/bin/python3.13 /opt/homebrew/opt/python@3.12/bin/python3.12 /opt/homebrew/opt/python@3.11/bin/python3.11
     /usr/local/bin/python3.13 /usr/local/bin/python3.12 /usr/local/bin/python3.11
-    python3 python
   )
   local candidate
   for candidate in "${candidates[@]}"; do
@@ -147,7 +171,10 @@ find_python() {
     fi
   done
 
-  fail "Python 3.11-3.13 was not found. If python3 is 3.14, run ./dependency.sh --python 3.12 to install/use a supported version."
+  if command -v python3 >/dev/null 2>&1; then
+    warn "Default python3 is unsupported: $(python_version_text python3). Python 3.11-3.13 is required."
+  fi
+  fail "Python 3.11-3.13 was not found. Run ./dependency.sh --python 3.12 to install/use a supported version."
 }
 
 archive_bad_venv_if_needed() {
@@ -172,14 +199,20 @@ log "Using Python: $PY ($(python_version_text "$PY"))"
 
 if [[ "$USE_VENV" -eq 1 ]]; then
   archive_bad_venv_if_needed
-  if [[ ! -d "$VENV_DIR" ]]; then
-    log "Creating virtual environment: $VENV_DIR"
-    "$PY" -m venv "$VENV_DIR"
-  else
+  if [[ "$PY" == "$VENV_DIR/bin/python" ]]; then
     log "Using existing virtual environment: $VENV_DIR"
+    source "$VENV_DIR/bin/activate"
+    PY="python"
+  else
+    if [[ ! -d "$VENV_DIR" ]]; then
+      log "Creating virtual environment: $VENV_DIR"
+      "$PY" -m venv "$VENV_DIR"
+    else
+      log "Using existing virtual environment: $VENV_DIR"
+    fi
+    source "$VENV_DIR/bin/activate"
+    PY="python"
   fi
-  source "$VENV_DIR/bin/activate"
-  PY="python"
   python_version_ok "$PY" || fail "Activated venv Python is unsupported: $(python_version_text "$PY")"
 else
   log "Using current Python environment without creating venv"
