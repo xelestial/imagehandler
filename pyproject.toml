@@ -34,6 +34,9 @@ transparent = [
 matting = [
   "pymatting>=1.1"
 ]
+head = [
+  "mediapipe>=0.10.14"
+]
 dev = [
   "pytest>=8.0",
   "ruff>=0.5"
