@@ -13,23 +13,47 @@ from .sheet import batch_split_cmd
 app = typer.Typer(help="Interactive menu launcher.", invoke_without_command=True, no_args_is_help=False)
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
+BISENET_MODEL_REL = Path("models") / "bisenet_face_parsing.onnx"
 
 DEFAULT_CONFIG = {
     "profile": "balanced",
-    "bg": {"backend": "auto", "model": None, "alpha_matting": False, "retry_on_fail": True, "continue_on_error": True, "recursive": True},
+    "bg": {
+        "backend": "auto",
+        "model": None,
+        "alpha_matting": False,
+        "retry_on_fail": True,
+        "continue_on_error": True,
+        "recursive": True,
+        "head": {
+            "mode": "mediapipe",  # off, mediapipe, bisenet
+            "debug": False,
+        },
+    },
     "sheet": {"views": 4, "padding": 24, "min_area": 1000, "merge_distance": 24, "normalize_size": None, "threshold": 28.0, "debug": True, "retry_on_fail": True, "continue_on_error": True},
     "items": {"padding": 16, "min_area": 120, "merge_distance": 12, "square_canvas": False, "normalize_size": None, "transparent_bg": False, "threshold": 28.0, "debug": True, "retry_on_fail": True, "min_count": 1, "continue_on_error": True},
 }
 
 PROFILES = {
-    "fast": {"bg": {"retry_on_fail": False}, "sheet": {"debug": False, "retry_on_fail": False}, "items": {"debug": False, "retry_on_fail": False}},
-    "balanced": {"bg": {"retry_on_fail": True}, "sheet": {"debug": True, "retry_on_fail": True}, "items": {"debug": True, "retry_on_fail": True}},
-    "high_quality": {"bg": {"retry_on_fail": True, "alpha_matting": True}, "sheet": {"debug": True, "retry_on_fail": True}, "items": {"debug": True, "retry_on_fail": True}},
+    "fast": {"bg": {"retry_on_fail": False, "head": {"mode": "off", "debug": False}}, "sheet": {"debug": False, "retry_on_fail": False}, "items": {"debug": False, "retry_on_fail": False}},
+    "balanced": {"bg": {"retry_on_fail": True, "head": {"mode": "mediapipe", "debug": False}}, "sheet": {"debug": True, "retry_on_fail": True}, "items": {"debug": True, "retry_on_fail": True}},
+    "high_quality": {"bg": {"retry_on_fail": True, "alpha_matting": True, "head": {"mode": "bisenet", "debug": True}}, "sheet": {"debug": True, "retry_on_fail": True}, "items": {"debug": True, "retry_on_fail": True}},
 }
 
 
 def _workspace_root() -> Path:
     return Path(os.environ.get("IMAGEHANDLER_WORKSPACE", "workspace"))
+
+
+def _project_root() -> Path:
+    return Path.cwd()
+
+
+def _bisenet_model_path() -> Path:
+    return _project_root() / BISENET_MODEL_REL
+
+
+def _bisenet_model_available() -> bool:
+    return _bisenet_model_path().is_file()
 
 
 def _ensure_workspace() -> Path:
@@ -62,6 +86,7 @@ def _load_config() -> dict:
             _deep_update(config, json.loads(path.read_text(encoding="utf-8")))
         except Exception:
             typer.echo(f"[WARN] Failed to read config: {path}. Using defaults.")
+    config.setdefault("bg", {}).setdefault("head", {"mode": "mediapipe", "debug": False})
     return config
 
 
@@ -123,22 +148,80 @@ def _show_hint() -> None:
     typer.echo(f"  {root}/<task>/failed/source.png")
 
 
+def _head_config(config: dict) -> dict:
+    return config.setdefault("bg", {}).setdefault("head", {"mode": "mediapipe", "debug": False})
+
+
+def _head_runtime_options(config: dict) -> tuple[bool, Path | None, bool]:
+    head = _head_config(config)
+    mode = str(head.get("mode", "mediapipe")).lower()
+    debug = bool(head.get("debug", False))
+    if mode == "off":
+        return False, None, debug
+    if mode == "bisenet":
+        model_path = _bisenet_model_path()
+        if model_path.is_file():
+            return True, model_path, debug
+        typer.echo(f"[WARN] BiSeNet model is not installed: {model_path}")
+        typer.echo("       Falling back to MediaPipe-only head refinement for this run.")
+        return True, None, debug
+    return True, None, debug
+
+
 def _show_config(config: dict) -> None:
+    head = _head_config(config)
     typer.echo("\nCurrent config")
     typer.echo(f"  Profile: {config.get('profile')}")
     typer.echo(f"  BG retry    : {config['bg']['retry_on_fail']}")
+    typer.echo(f"  BG head     : mode={head.get('mode')} debug={head.get('debug')}")
+    typer.echo(f"  BiSeNet ONNX: {_bisenet_model_path()} ({'installed' if _bisenet_model_available() else 'missing'})")
     typer.echo(f"  Sheet retry : {config['sheet']['retry_on_fail']} / views={config['sheet']['views']}")
     typer.echo(f"  Items retry : {config['items']['retry_on_fail']}")
+
+
+def _head_settings_menu(config: dict) -> dict:
+    head = _head_config(config)
+    while True:
+        typer.echo("\nHead refinement settings")
+        typer.echo(f"  Mode         : {head.get('mode', 'mediapipe')}")
+        typer.echo(f"  Debug images : {head.get('debug', False)}")
+        typer.echo(f"  BiSeNet model: {_bisenet_model_path()} ({'installed' if _bisenet_model_available() else 'missing'})")
+        choice = _choose(
+            "Head settings",
+            [
+                ("mode", "Choose head mode: off / mediapipe / bisenet"),
+                ("debug", "Toggle head debug sidecar images"),
+                ("back", "Back"),
+            ],
+        )
+        if choice == "mode":
+            mode = _choose(
+                "Head mode",
+                [
+                    ("off", "Off - no head refinement"),
+                    ("mediapipe", "MediaPipe FaceMesh ROI only"),
+                    ("bisenet", f"BiSeNet face parsing if model exists at {BISENET_MODEL_REL}"),
+                ],
+            )
+            head["mode"] = mode
+            _save_config(config)
+        elif choice == "debug":
+            head["debug"] = not bool(head.get("debug", False))
+            _save_config(config)
+        else:
+            return config
 
 
 def _config_menu(config: dict) -> dict:
     while True:
         _show_config(config)
-        choice = _choose("Config", [("profile", "Choose profile"), ("reset", "Reset defaults"), ("back", "Back")])
+        choice = _choose("Config", [("profile", "Choose profile"), ("head", "Head refinement settings"), ("reset", "Reset defaults"), ("back", "Back")])
         if choice == "profile":
             profile = _choose("Profile", [("fast", "Fast"), ("balanced", "Balanced"), ("high_quality", "High quality")])
             _apply_profile(config, profile)
             _save_config(config)
+        elif choice == "head":
+            config = _head_settings_menu(config)
         elif choice == "reset":
             config = json.loads(json.dumps(DEFAULT_CONFIG))
             _save_config(config)
@@ -165,7 +248,22 @@ def _quick_bg(config: dict) -> None:
     if not pending:
         return
     opts = config["bg"]
-    batch_remove_cmd(input_dir, None, _workspace_root(), opts["recursive"], None, opts["backend"], opts.get("model"), opts["alpha_matting"], opts["retry_on_fail"], opts["continue_on_error"])
+    head_refine, bisenet_onnx, head_debug = _head_runtime_options(config)
+    batch_remove_cmd(
+        input_dir,
+        None,
+        _workspace_root(),
+        opts["recursive"],
+        None,
+        opts["backend"],
+        opts.get("model"),
+        opts["alpha_matting"],
+        opts["retry_on_fail"],
+        head_refine,
+        bisenet_onnx,
+        head_debug,
+        opts["continue_on_error"],
+    )
 
 
 def _quick_sheet(config: dict) -> None:
