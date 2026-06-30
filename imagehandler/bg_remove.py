@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from PIL import Image, ImageFilter
@@ -13,6 +14,7 @@ from .bg_refine import (
     smooth_alpha_edges,
     zero_transparent_rgb,
 )
+from .head_refine import refine_head_alpha_with_face_priority
 from .io import load_image, sidecar_path
 from .mask_ops import (
     apply_mask_as_alpha,
@@ -53,6 +55,7 @@ def remove_background(
     postprocess: bool = True,
     feather: float = 0.0,
     cleanup_mode: str = "safe",
+    head_refine: bool = True,
 ) -> OperationReport:
     source_image = load_image(input_path, "RGBA")
     output = Path(output_path)
@@ -62,6 +65,7 @@ def remove_background(
     backend_label = selected_backend
     warnings: list[str] = []
     critical_failure = False
+    head_metrics: dict[str, Any] = {}
 
     if selected_backend == "rembg":
         rembg_model = normalize_rembg_model(model)
@@ -90,6 +94,19 @@ def remove_background(
             mode=cleanup_mode,
         )
         soft_alpha = _clip_soft_alpha_to_support(soft_alpha, refined_support)
+
+        # Face/head refinement is ON by default. It prefers MediaPipe FaceMesh
+        # when installed, and otherwise falls back to a head-local heuristic.
+        # Only head-local background-colored pixels connected to ROI borders are
+        # removed, avoiding global white cleanup that can damage clothing.
+        head_result = refine_head_alpha_with_face_priority(
+            source_image,
+            soft_alpha,
+            enabled=head_refine,
+        )
+        soft_alpha = head_result.alpha
+        head_metrics = head_result.metrics
+
         soft_alpha = smooth_alpha_edges(soft_alpha, radius=0.65)
         rgba = _apply_soft_alpha(rgba, soft_alpha)
         rgba = decontaminate_edge_rgb(rgba, solid_alpha=250, width=3.0)
@@ -111,6 +128,7 @@ def remove_background(
     metrics = mask_metrics(mask)
     alpha_metrics = alpha_quality_metrics(rgba)
     metrics.update(alpha_metrics)
+    metrics.update(head_metrics)
 
     if metrics["foreground_area_ratio"] < 0.005:
         warnings.append("Foreground mask is extremely small.")
