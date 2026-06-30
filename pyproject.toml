@@ -7,7 +7,7 @@ name = "imagehandler"
 version = "0.1.0"
 description = "CLI pipelines for background removal, character sheet splitting, and whitespace/object extraction."
 readme = "README.md"
-requires-python = ">=3.11,<3.14"
+requires-python = ">=3.11,<3.15"
 license = { text = "MIT" }
 authors = [{ name = "xelestial" }]
 dependencies = [
