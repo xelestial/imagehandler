@@ -3,7 +3,6 @@ set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="${VENV_DIR:-$ROOT_DIR/.venv}"
-PYTHON_BIN="${PYTHON_BIN:-}"
 PYTHON_BIN_FILE="$ROOT_DIR/.python-bin"
 ENV_FILE="$ROOT_DIR/.imagehandler-env"
 WORKSPACE_DIR="${WORKSPACE_DIR:-$ROOT_DIR/workspace}"
@@ -13,6 +12,10 @@ WITH_MATTING=0
 WITH_DEV=0
 USE_VENV=1
 SKIP_SMOKE=0
+CHECK_ONLY=0
+FIX_OWNER=0
+PREFERRED_PYTHON="${PYTHON_VERSION:-}"
+PYTHON_BIN="${PYTHON_BIN:-}"
 
 OS_NAME="$(uname -s 2>/dev/null || echo unknown)"
 ARCH_NAME="$(uname -m 2>/dev/null || echo unknown)"
@@ -35,40 +38,40 @@ usage() {
   cat <<'USAGE'
 Usage: ./setup.sh [options]
 
+Single installer for ImageHandler. This replaces the old split between
+setup.sh and dependency.sh.
+
 Options:
+  --python 3.14      Preferred Python version or executable. Default: auto.
   --cpu              Install CPU background-removal stack. Default.
-  --gpu              Install NVIDIA/CUDA rembg GPU stack. Not supported on normal macOS.
+  --gpu              Install NVIDIA/CUDA rembg GPU stack.
   --transparent      Also install transparent-background backend.
   --matting          Also install pymatting backend.
   --dev              Also install pytest and ruff.
   --all              Install CPU stack plus transparent, matting, and dev tools.
-  --no-venv          Install into the currently active Python environment.
+  --no-venv          Install into the current Python environment.
   --skip-smoke       Skip smoke tests after installation.
-  --workspace DIR    Create optimized workspace folders under DIR. Default: ./workspace
+  --workspace DIR    Create workspace folders under DIR. Default: ./workspace
+  --check-only       Only check Python and system dependency state.
+  --fix-owner        Fix local project ownership if previous sudo runs created root-owned files.
   -h, --help         Show this help.
 
-Interpreter resolution:
-  1) existing valid .venv/bin/python
-  2) .python-bin written by dependency.sh
-  3) PYTHON_BIN environment variable
-  4) PATH candidates: python3.13 / python3.12 / python3.11
+Python policy:
+  Python 3.11 through 3.14 is accepted. Existing .venv/bin/python is used first.
 
-Python requirement:
-  Python 3.11-3.13. Python 3.14 is intentionally avoided for now because some
-  image / ML wheels may lag behind new CPython releases.
+Recommended:
+  ./setup.sh
+  ./run.sh
 USAGE
 }
 
-if [[ "$IS_MAC" -eq 1 ]]; then
-  export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:$PATH"
-fi
-
-if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
-  warn "Running setup with sudo/root is not recommended. Run './setup.sh' as your normal user."
-fi
-
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --python)
+      [[ $# -ge 2 ]] || fail "--python requires a value"
+      PREFERRED_PYTHON="$2"
+      shift
+      ;;
     --cpu) MODE="cpu" ;;
     --gpu) MODE="gpu" ;;
     --transparent) WITH_TRANSPARENT=1 ;;
@@ -82,6 +85,8 @@ while [[ $# -gt 0 ]]; do
       WORKSPACE_DIR="$2"
       shift
       ;;
+    --check|--check-only) CHECK_ONLY=1 ;;
+    --fix-owner) FIX_OWNER=1 ;;
     -h|--help) usage; exit 0 ;;
     *) fail "Unknown option: $1" ;;
   esac
@@ -90,20 +95,25 @@ done
 
 cd "$ROOT_DIR"
 
-log "Detected OS: $OS_NAME / $ARCH_NAME"
-if [[ "$IS_WSL" -eq 1 ]]; then
-  log "WSL detected"
+if [[ "$IS_MAC" -eq 1 ]]; then
+  export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/local/sbin:$PATH"
 fi
-if [[ "$IS_MAC" -eq 1 && "$MODE" == "gpu" ]]; then
-  warn "macOS does not use the rembg NVIDIA/CUDA GPU path. Falling back to --cpu."
-  MODE="cpu"
+
+if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
+  warn "Running setup with sudo/root is not recommended. Run './setup.sh' as your normal user."
+fi
+
+if [[ "$FIX_OWNER" -eq 1 ]]; then
+  owner="${SUDO_USER:-$(whoami)}"
+  log "Fixing project ownership for $owner"
+  sudo chown -R "$owner" "$ROOT_DIR" 2>/dev/null || warn "chown failed or not needed"
 fi
 
 python_version_ok() {
   "$1" - <<'PY' >/dev/null 2>&1
 import sys
 v = sys.version_info
-raise SystemExit(0 if ((v.major, v.minor) >= (3, 11) and (v.major, v.minor) < (3, 14)) else 1)
+raise SystemExit(0 if ((v.major, v.minor) >= (3, 11) and (v.major, v.minor) < (3, 15)) else 1)
 PY
 }
 
@@ -114,95 +124,115 @@ print(f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micr
 PY
 }
 
-resolve_existing_venv_python() {
-  if [[ "$USE_VENV" -eq 1 && -x "$VENV_DIR/bin/python" ]]; then
-    if python_version_ok "$VENV_DIR/bin/python"; then
-      printf '%s\n' "$VENV_DIR/bin/python"
-      return 0
-    fi
-  fi
-  return 1
-}
-
 resolve_python_bin_file() {
-  if [[ -f "$PYTHON_BIN_FILE" ]]; then
-    local p
-    p="$(tr -d '\r\n' < "$PYTHON_BIN_FILE")"
-    if [[ -n "$p" && ( -x "$p" || $(command -v "$p" >/dev/null 2>&1; echo $?) -eq 0 ) ]]; then
-      if python_version_ok "$p"; then
-        command -v "$p" 2>/dev/null || printf '%s\n' "$p"
-        return 0
-      fi
-      warn ".python-bin points to unsupported Python: $p ($(python_version_text "$p"))"
-    fi
+  if [[ ! -f "$PYTHON_BIN_FILE" ]]; then
+    return 1
+  fi
+  local p
+  p="$(tr -d '\r\n' < "$PYTHON_BIN_FILE")"
+  [[ -n "$p" ]] || return 1
+  if ([[ -x "$p" ]] || command -v "$p" >/dev/null 2>&1) && python_version_ok "$p"; then
+    command -v "$p" 2>/dev/null || printf '%s\n' "$p"
+    return 0
   fi
   return 1
 }
 
 find_python() {
-  # Existing venv is the source of truth. This is the whole point of venv.
-  if resolve_existing_venv_python; then
-    return
-  fi
-
-  # dependency.sh stores the interpreter used to create the venv here.
-  if resolve_python_bin_file; then
+  if [[ "$USE_VENV" -eq 1 && -x "$VENV_DIR/bin/python" ]] && python_version_ok "$VENV_DIR/bin/python"; then
+    printf '%s\n' "$VENV_DIR/bin/python"
     return
   fi
 
   if [[ -n "$PYTHON_BIN" ]]; then
-    command -v "$PYTHON_BIN" >/dev/null 2>&1 || fail "PYTHON_BIN not found: $PYTHON_BIN"
-    python_version_ok "$PYTHON_BIN" || fail "PYTHON_BIN must be Python >=3.11 and <3.14: $PYTHON_BIN ($(python_version_text "$PYTHON_BIN"))"
-    printf '%s\n' "$PYTHON_BIN"
+    if ([[ -x "$PYTHON_BIN" ]] || command -v "$PYTHON_BIN" >/dev/null 2>&1) && python_version_ok "$PYTHON_BIN"; then
+      command -v "$PYTHON_BIN" 2>/dev/null || printf '%s\n' "$PYTHON_BIN"
+      return
+    fi
+    fail "PYTHON_BIN is not a supported Python 3.11-3.14 executable: $PYTHON_BIN"
+  fi
+
+  if resolve_python_bin_file; then
     return
   fi
 
-  local candidates=(
-    python3.13 python3.12 python3.11
-    /opt/homebrew/bin/python3.13 /opt/homebrew/bin/python3.12 /opt/homebrew/bin/python3.11
-    /opt/homebrew/opt/python@3.13/bin/python3.13 /opt/homebrew/opt/python@3.12/bin/python3.12 /opt/homebrew/opt/python@3.11/bin/python3.11
-    /usr/local/bin/python3.13 /usr/local/bin/python3.12 /usr/local/bin/python3.11
-  )
-  local candidate
-  for candidate in "${candidates[@]}"; do
-    if command -v "$candidate" >/dev/null 2>&1 && python_version_ok "$candidate"; then
-      printf '%s\n' "$candidate"
+  local candidates=()
+  if [[ -n "$PREFERRED_PYTHON" ]]; then
+    if [[ "$PREFERRED_PYTHON" == */* ]]; then
+      candidates+=("$PREFERRED_PYTHON")
+    else
+      candidates+=("python${PREFERRED_PYTHON}")
+    fi
+  fi
+  candidates+=(python3.14 python3.13 python3.12 python3.11 python3 python)
+  candidates+=(/usr/local/bin/python3.14 /usr/local/bin/python3.13 /usr/local/bin/python3.12 /usr/local/bin/python3.11)
+  candidates+=(/opt/homebrew/bin/python3.14 /opt/homebrew/bin/python3.13 /opt/homebrew/bin/python3.12 /opt/homebrew/bin/python3.11)
+
+  local p
+  for p in "${candidates[@]}"; do
+    if ([[ -x "$p" ]] || command -v "$p" >/dev/null 2>&1) && python_version_ok "$p"; then
+      command -v "$p" 2>/dev/null || printf '%s\n' "$p"
       return
     fi
   done
+}
 
-  if command -v python3 >/dev/null 2>&1; then
-    warn "Default python3 is unsupported: $(python_version_text python3). Python 3.11-3.13 is required."
-  fi
-  fail "Python 3.11-3.13 was not found. Run ./dependency.sh --python 3.12 to install/use a supported version."
+install_linux_runtime_deps() {
+  [[ "$IS_LINUX" -eq 1 ]] || return
+  command -v apt-get >/dev/null 2>&1 || return
+  command -v sudo >/dev/null 2>&1 || return
+
+  log "Installing Linux/WSL runtime dependencies if needed"
+  sudo apt-get update
+  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    ca-certificates git build-essential pkg-config \
+    libgl1 libglib2.0-0 libsm6 libxext6 libxrender1
 }
 
 archive_bad_venv_if_needed() {
   if [[ ! -x "$VENV_DIR/bin/python" ]]; then
     return
   fi
-
   if python_version_ok "$VENV_DIR/bin/python"; then
     return
   fi
-
   local version backup
   version="$(python_version_text "$VENV_DIR/bin/python")"
   backup="$ROOT_DIR/.venv.invalid.$(date +%Y%m%d_%H%M%S)"
-  warn "Existing venv Python is unsupported: ${version:-unknown}. Python 3.11-3.13 is required."
-  warn "Moving bad venv to: $backup"
+  warn "Existing venv Python is unsupported: ${version:-unknown}. Moving it to $backup"
   mv "$VENV_DIR" "$backup"
 }
 
-PY="$(find_python)"
+log "Detected OS: $OS_NAME / $ARCH_NAME"
+if [[ "$IS_WSL" -eq 1 ]]; then
+  log "WSL detected"
+fi
+
+if [[ "$IS_MAC" -eq 1 && "$MODE" == "gpu" ]]; then
+  warn "macOS does not use the rembg NVIDIA/CUDA GPU path. Falling back to --cpu."
+  MODE="cpu"
+fi
+
+archive_bad_venv_if_needed
+install_linux_runtime_deps || warn "Linux runtime dependency install skipped or failed; continuing."
+
+PY="$(find_python || true)"
+[[ -n "$PY" ]] || fail "Python 3.11-3.14 was not found. Install Python or run with --python /path/to/python."
+
 log "Using Python: $PY ($(python_version_text "$PY"))"
+printf '%s\n' "$PY" > "$PYTHON_BIN_FILE"
+cat > "$ENV_FILE" <<EOF
+export PYTHON_BIN="$PY"
+EOF
+
+if [[ "$CHECK_ONLY" -eq 1 ]]; then
+  log "Check-only complete"
+  exit 0
+fi
 
 if [[ "$USE_VENV" -eq 1 ]]; then
-  archive_bad_venv_if_needed
   if [[ "$PY" == "$VENV_DIR/bin/python" ]]; then
     log "Using existing virtual environment: $VENV_DIR"
-    source "$VENV_DIR/bin/activate"
-    PY="python"
   else
     if [[ ! -d "$VENV_DIR" ]]; then
       log "Creating virtual environment: $VENV_DIR"
@@ -210,12 +240,10 @@ if [[ "$USE_VENV" -eq 1 ]]; then
     else
       log "Using existing virtual environment: $VENV_DIR"
     fi
-    source "$VENV_DIR/bin/activate"
-    PY="python"
   fi
+  source "$VENV_DIR/bin/activate"
+  PY="python"
   python_version_ok "$PY" || fail "Activated venv Python is unsupported: $(python_version_text "$PY")"
-else
-  log "Using current Python environment without creating venv"
 fi
 
 log "Upgrading packaging tools"
@@ -319,7 +347,7 @@ else
   warn "Smoke tests skipped"
 fi
 
-log "Creating optimized workspace structure"
+log "Creating workspace structure"
 mkdir -p \
   "$WORKSPACE_DIR/bg/input" "$WORKSPACE_DIR/bg/jobs" "$WORKSPACE_DIR/bg/failed" \
   "$WORKSPACE_DIR/sheets/input" "$WORKSPACE_DIR/sheets/jobs" "$WORKSPACE_DIR/sheets/failed" \
@@ -327,7 +355,7 @@ mkdir -p \
   "$WORKSPACE_DIR/reports"
 
 cat > "$WORKSPACE_DIR/README.txt" <<EOF
-ImageHandler optimized workspace
+ImageHandler workspace
 
 Put source files here:
   bg/input
@@ -341,25 +369,11 @@ Success flow:
 
 Failure flow:
   <task>/failed/source.png
-
-Reports:
-  reports/
 EOF
 
-log "Workspace created: $WORKSPACE_DIR"
 log "Setup complete"
-if [[ "$USE_VENV" -eq 1 ]]; then
-  cat <<EOF
-
-Activate later with:
-  source "$VENV_DIR/bin/activate"
+cat <<EOF
 
 Recommended workflow:
-  1) Put files into:
-     $WORKSPACE_DIR/bg/input
-     $WORKSPACE_DIR/sheets/input
-     $WORKSPACE_DIR/items/input
-  2) Run:
-     ./run.sh
+  ./run.sh
 EOF
-fi
