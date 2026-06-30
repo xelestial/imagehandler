@@ -46,8 +46,8 @@ Options:
   --python 3.14      Preferred Python version or executable. Default: auto.
   --cpu              Install CPU background-removal stack. Default.
   --gpu              Install NVIDIA/CUDA rembg GPU stack.
-  --head             Install MediaPipe FaceMesh dependency. Default.
-  --no-head          Skip MediaPipe install; head refinement falls back to heuristic.
+  --head             Install MediaPipe FaceMesh and ONNX Runtime. Default.
+  --no-head          Skip head dependency install; head refinement falls back to safe mode.
   --transparent      Also install transparent-background backend.
   --matting          Also install pymatting backend.
   --dev              Also install pytest and ruff.
@@ -288,7 +288,7 @@ case "$MODE" in
 esac
 
 if [[ "$WITH_HEAD" -eq 1 ]]; then
-  install_optional_packages "mediapipe>=0.10.14"
+  install_optional_packages "mediapipe>=0.10.14" "onnxruntime>=1.17"
 fi
 
 if [[ "$WITH_TRANSPARENT" -eq 1 ]]; then
@@ -317,11 +317,12 @@ for module in required:
         missing.append(module)
 if missing:
     raise SystemExit(1)
-try:
-    importlib.import_module("mediapipe")
-    print("OK optional: mediapipe")
-except Exception as exc:
-    print(f"WARN optional: mediapipe unavailable -> {exc}")
+for module in ["mediapipe", "onnxruntime"]:
+    try:
+        importlib.import_module(module)
+        print(f"OK optional: {module}")
+    except Exception as exc:
+        print(f"WARN optional: {module} unavailable -> {exc}")
 PY
 
 if [[ "$SKIP_SMOKE" -eq 0 ]]; then
