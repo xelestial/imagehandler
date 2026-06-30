@@ -21,6 +21,11 @@ REMBG_MODEL_FALLBACKS = [
     "isnet-anime",
     "isnet-general-use",
 ]
+PREVIEW_SUFFIXES = (
+    ".preview.white.png",
+    ".preview.black.png",
+    ".preview.checker.png",
+)
 
 
 @dataclass
@@ -79,7 +84,10 @@ class FallbackSummary:
 
 
 def _is_acceptable(report: QualityReport, accept_verdict: str, min_score: float) -> bool:
-    return VERDICT_RANK.get(report.verdict, 0) >= VERDICT_RANK.get(accept_verdict, 2) and report.score >= min_score
+    return (
+        VERDICT_RANK.get(report.verdict, 0) >= VERDICT_RANK.get(accept_verdict, 2)
+        and report.score >= min_score
+    )
 
 
 def _best_attempt(attempts: list[tuple[AttemptRecord, QualityReport, Any, Path]]):
@@ -93,11 +101,16 @@ def _attempt_name(backend: str, cfg: dict[str, Any]) -> str:
 
 
 def _append_unique(candidates: list[tuple[str, dict[str, Any]]], backend: str, cfg: dict[str, Any]) -> None:
-    if not any(existing_backend == backend and existing_cfg == cfg for existing_backend, existing_cfg in candidates):
+    if not any(
+        existing_backend == backend and existing_cfg == cfg
+        for existing_backend, existing_cfg in candidates
+    ):
         candidates.append((backend, cfg))
 
 
-def _background_candidates(backend: str, model: str | None, alpha_matting: bool) -> list[tuple[str, dict[str, Any]]]:
+def _background_candidates(
+    backend: str, model: str | None, alpha_matting: bool
+) -> list[tuple[str, dict[str, Any]]]:
     backend = backend.lower()
     candidates: list[tuple[str, dict[str, Any]]] = []
 
@@ -123,6 +136,25 @@ def _background_candidates(backend: str, model: str | None, alpha_matting: bool)
     if backend != "classical":
         _append_unique(candidates, "classical", {})
     return candidates
+
+
+def _copy_bg_sidecars(selected_output: Path, output_path: Path) -> list[str]:
+    outputs = [str(output_path)]
+
+    selected_mask = selected_output.with_name(f"{selected_output.stem}.mask.png")
+    final_mask = output_path.with_name(f"{output_path.stem}.mask.png")
+    if selected_mask.exists():
+        shutil.copy2(selected_mask, final_mask)
+        outputs.append(str(final_mask))
+
+    for suffix in PREVIEW_SUFFIXES:
+        selected_preview = selected_output.with_name(f"{selected_output.stem}{suffix}")
+        final_preview = output_path.with_name(f"{output_path.stem}{suffix}")
+        if selected_preview.exists():
+            shutil.copy2(selected_preview, final_preview)
+            outputs.append(str(final_preview))
+
+    return outputs
 
 
 def remove_background_with_fallback(
@@ -200,19 +232,17 @@ def remove_background_with_fallback(
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(selected_output, output_path)
+        copied_outputs = _copy_bg_sidecars(selected_output, output_path)
 
-        selected_mask = selected_output.with_name(f"{selected_output.stem}.mask.png")
-        final_mask = output_path.with_name(f"{output_path.stem}.mask.png")
-        if selected_mask.exists():
-            shutil.copy2(selected_mask, final_mask)
         selected_report_path = selected_output.with_name(f"{selected_output.stem}.report.json")
         final_report_path = output_path.with_name(f"{output_path.stem}.report.json")
         if selected_report_path.exists():
             shutil.copy2(selected_report_path, final_report_path)
 
-        selected_report.outputs = [str(output_path)] + ([str(final_mask)] if final_mask.exists() else [])
+        selected_report.outputs = copied_outputs
         selected_report.source = str(input_path)
         selected_report.backend = selected_record.name
+        selected_report.ok = selected_judge.verdict in {"PASS", "WARN"}
         selected_report.save(output_path.with_name(f"{output_path.stem}.report.json"))
         summary = FallbackSummary(
             operation="remove-bg",
