@@ -9,6 +9,7 @@ from typing import Any, Literal
 import numpy as np
 from PIL import Image
 
+from .alpha_quality import alpha_quality_metrics
 from .debug import save_mask
 from .io import ensure_output_dir, load_image
 from .mask_ops import (
@@ -106,12 +107,16 @@ def judge_image(
         alpha_required = task == "remove-bg"
 
     mask = _mask_for_image(image, task=task)
-    mask = clean_mask(mask, open_size=3, close_size=5, fill_holes=False)
+    # Keep judge morphology small. Heavy cleanup hides real edge/component issues.
+    mask = clean_mask(mask, open_size=1, close_size=2, fill_holes=False)
     base_metrics = mask_metrics(mask)
+    alpha_metrics = alpha_quality_metrics(image)
     bbox = bbox_from_mask(mask)
     components = components_bboxes(mask, min_area=max(16, int(w * h * 0.00005)), min_size=2)
     component_areas = [area for _box, area in components]
     largest_component_ratio = float(max(component_areas) / max(1, sum(component_areas))) if component_areas else 0.0
+    component_count = int(alpha_metrics.get("component_count", len(components)))
+    layout_hint = _layout_hint_for_components(component_count, task)
 
     warnings: list[str] = []
     failures: list[str] = []
@@ -151,20 +156,22 @@ def judge_image(
         score -= 15
 
     if component_areas and largest_component_ratio < 0.45 and task in {"generic", "remove-bg"}:
-        warnings.append("Foreground is fragmented into several similarly sized components.")
-        score -= 12
+        if layout_hint == "single_subject_or_unknown":
+            warnings.append("Foreground is fragmented into several similarly sized components.")
+            score -= 12
+        else:
+            warnings.append(f"Foreground has {component_count} main components; treated as {layout_hint}.")
+            score -= 2
 
     if alpha_required and not has_meaningful_alpha:
         failures.append("Expected a transparent/alpha result, but the image has no meaningful transparency.")
         score -= 45
 
     if task == "remove-bg":
+        score = _score_alpha_quality(alpha_metrics, warnings, failures, score)
         if transparent_ratio < 0.02:
             warnings.append("Very little transparent background was produced.")
             score -= 20
-        if semi_alpha_ratio == 0 and has_meaningful_alpha:
-            warnings.append("Alpha edge is binary only; edges may look jagged. Consider feathering or alpha matting.")
-            score -= 5
 
     margins = _bbox_margins(bbox, w, h) if bbox else None
     if margins:
@@ -186,7 +193,9 @@ def judge_image(
         "semi_alpha_ratio": semi_alpha_ratio,
         "component_count": len(components),
         "largest_component_ratio": largest_component_ratio,
+        "layout_hint": layout_hint,
         **base_metrics,
+        "alpha_quality": alpha_metrics,
     }
     if bbox:
         metrics["bbox"] = bbox.to_list()
@@ -202,6 +211,62 @@ def judge_image(
         failures=failures,
         metrics=metrics,
     )
+
+
+def _score_alpha_quality(
+    metrics: dict[str, Any],
+    warnings: list[str],
+    failures: list[str],
+    score: float,
+) -> float:
+    unique_levels = int(metrics.get("alpha_unique_levels", 0))
+    soft_fg_ratio = float(metrics.get("soft_alpha_fg_ratio", 0.0))
+    transparent_leak = float(metrics.get("transparent_rgb_leak_ratio", 0.0))
+    jaggedness = float(metrics.get("edge_jaggedness_ratio", 0.0))
+    semi_dark = float(metrics.get("semi_dark_rgb_ratio", 0.0))
+    semi_light = float(metrics.get("semi_light_rgb_ratio", 0.0))
+    edge_band = float(metrics.get("edge_band_ratio", 0.0))
+
+    if transparent_leak > 0.01:
+        warnings.append("Transparent pixels contain RGB data; this often creates halos in game engines.")
+        score -= 18
+    elif transparent_leak > 0.001:
+        warnings.append("Small transparent RGB leakage detected.")
+        score -= 8
+
+    if unique_levels <= 2:
+        warnings.append("Alpha matte is binary; edge quality is likely jagged.")
+        score -= 18
+    elif unique_levels < 16:
+        warnings.append("Alpha matte has very few levels; edge may be too hard.")
+        score -= 10
+
+    if soft_fg_ratio < 0.015:
+        warnings.append("Very little soft alpha transition; silhouette may look cut out.")
+        score -= 8
+    elif soft_fg_ratio > 0.45:
+        warnings.append("Too much soft alpha transition; result may look blurry or transparent around edges.")
+        score -= 8
+
+    if jaggedness > 1.28:
+        warnings.append("Severe jagged alpha boundary detected.")
+        score -= 14
+    elif jaggedness > 1.16:
+        warnings.append("Jagged alpha boundary detected.")
+        score -= 8
+
+    if semi_dark > 0.35:
+        warnings.append("Many semi-transparent edge pixels are very dark; black halo may appear.")
+        score -= 8
+    if semi_light > 0.55:
+        warnings.append("Many semi-transparent edge pixels are very light; white halo may appear.")
+        score -= 6
+
+    if edge_band > 0.18:
+        warnings.append("Very wide alpha edge band; matte may be over-smoothed.")
+        score -= 6
+
+    return score
 
 
 def judge_directory(
@@ -315,9 +380,26 @@ def _infer_task(target: Path, expected_count: int | None) -> str:
     return "generic"
 
 
+def _layout_hint_for_components(component_count: int, task: str) -> str:
+    if task == "remove-bg":
+        if component_count == 1:
+            return "single_subject"
+        if 2 <= component_count <= 6:
+            return "multi_view_or_multi_subject_sheet"
+        if 7 <= component_count <= 12:
+            return "large_multi_subject_sheet"
+    return "single_subject_or_unknown"
+
+
 def _result_images(folder: Path) -> list[Path]:
     ignored_prefixes = ("debug_",)
-    ignored_suffixes = (".mask.png", ".judge_mask.png")
+    ignored_suffixes = (
+        ".mask.png",
+        ".judge_mask.png",
+        ".preview.white.png",
+        ".preview.black.png",
+        ".preview.checker.png",
+    )
     images: list[Path] = []
     for p in sorted(folder.glob("*.png")):
         name = p.name
@@ -368,6 +450,6 @@ def _read_existing_manifest_warnings(folder: Path) -> list[str]:
 def _verdict(score: float, failures: list[str]) -> Verdict:
     if failures or score < 60:
         return "FAIL"
-    if score < 85:
+    if score < 90:
         return "WARN"
     return "PASS"
