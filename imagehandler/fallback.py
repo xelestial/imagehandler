@@ -26,6 +26,13 @@ PREVIEW_SUFFIXES = (
     ".preview.black.png",
     ".preview.checker.png",
 )
+HEAD_DEBUG_SUFFIXES = (
+    ".head.before.png",
+    ".head.after.png",
+    ".head.removed.png",
+    ".head.roi.png",
+    ".head.labels.png",
+)
 
 
 @dataclass
@@ -147,7 +154,7 @@ def _copy_bg_sidecars(selected_output: Path, output_path: Path) -> list[str]:
         shutil.copy2(selected_mask, final_mask)
         outputs.append(str(final_mask))
 
-    for suffix in PREVIEW_SUFFIXES:
+    for suffix in (*PREVIEW_SUFFIXES, *HEAD_DEBUG_SUFFIXES):
         selected_preview = selected_output.with_name(f"{selected_output.stem}{suffix}")
         final_preview = output_path.with_name(f"{output_path.stem}{suffix}")
         if selected_preview.exists():
@@ -168,6 +175,9 @@ def remove_background_with_fallback(
     feather: float = 0.0,
     accept_verdict: str = "PASS",
     min_score: float = 85.0,
+    head_refine: bool = True,
+    bisenet_onnx: str | Path | None = None,
+    head_debug: bool = False,
 ) -> tuple[OperationReport, FallbackSummary]:
     output_path = Path(output_path)
     candidates = _background_candidates(backend, model, alpha_matting)
@@ -192,6 +202,9 @@ def remove_background_with_fallback(
                     postprocess=postprocess,
                     feather=feather,
                     cleanup_mode="safe",
+                    head_refine=head_refine,
+                    bisenet_onnx=bisenet_onnx,
+                    head_debug=head_debug,
                 )
                 judge = judge_image(attempt_output, task="remove-bg", alpha_required=not mask_only)
             except Exception as exc:
@@ -258,136 +271,103 @@ def remove_background_with_fallback(
         return selected_report, summary
 
 
-def split_sheet_with_retry(
+def split_sheet_with_fallback(
     input_path: str | Path,
     output_dir: str | Path,
-    views: int = 4,
-    padding: int = 24,
-    min_area: int = 1000,
-    merge_distance: int = 24,
-    normalize: int | None = None,
-    threshold: float = 28.0,
-    debug: bool = False,
-    accept_verdict: str = "PASS",
-    min_score: float = 85.0,
+    views: int | None = None,
+    min_score: float = 75.0,
 ) -> tuple[OperationReport, FallbackSummary]:
     output_dir = Path(output_dir)
-    candidates = [
-        {"threshold": threshold, "min_area": min_area, "merge_distance": merge_distance},
-        {"threshold": max(8.0, threshold - 8.0), "min_area": max(64, min_area // 2), "merge_distance": merge_distance},
-        {"threshold": threshold + 8.0, "min_area": min_area, "merge_distance": merge_distance + 12},
-        {"threshold": threshold, "min_area": max(64, min_area // 3), "merge_distance": merge_distance + 24},
-    ]
-
     attempts: list[tuple[AttemptRecord, QualityReport, OperationReport, Path]] = []
-    selected_idx = 0
-    with TemporaryDirectory(prefix="imagehandler_split_retry_") as tmpdir:
+
+    candidate_views = [views] if views else [4, 5, 6, 8]
+    with TemporaryDirectory(prefix="imagehandler_sheet_retry_") as tmpdir:
         tmp_root = Path(tmpdir)
-        for idx, cfg in enumerate(candidates, start=1):
-            attempt_dir = tmp_root / f"attempt_{idx:02d}"
-            report = split_sheet(
-                input_path=input_path,
-                output_dir=attempt_dir,
-                views=views,
-                padding=padding,
-                min_area=cfg["min_area"],
-                merge_distance=cfg["merge_distance"],
-                normalize=normalize,
-                threshold=cfg["threshold"],
-                debug=debug,
-            )
-            judge = judge_directory(attempt_dir, task="split-sheet", expected_count=views)
-            accepted = _is_acceptable(judge, accept_verdict, min_score)
+        for idx, candidate_views_count in enumerate(candidate_views, start=1):
+            attempt_dir = tmp_root / f"attempt_{idx:02d}_{candidate_views_count}views"
+            try:
+                report = split_sheet(input_path, attempt_dir, views=candidate_views_count)
+                judge = judge_directory(attempt_dir, task="split-sheet")
+            except Exception as exc:
+                report = OperationReport(ok=False, operation="split-sheet", source=str(input_path))
+                judge = QualityReport(
+                    ok=False,
+                    verdict="FAIL",
+                    score=0.0,
+                    task="split-sheet",
+                    target=str(attempt_dir),
+                    failures=[f"attempt runtime error: {exc}"],
+                )
+            accepted = judge.verdict in {"PASS", "WARN"} and judge.score >= min_score
             record = AttemptRecord(
-                name=f"strategy:{idx}",
+                name=f"split:{candidate_views_count}views",
                 verdict=judge.verdict,
                 score=judge.score,
                 accepted=accepted,
                 target=str(attempt_dir),
                 warnings=list(judge.warnings),
                 failures=list(judge.failures),
-                details=cfg,
+                details={"views": candidate_views_count},
             )
             attempts.append((record, judge, report, attempt_dir))
             if accepted:
-                selected_idx = len(attempts) - 1
                 break
 
-        best = _best_attempt(attempts)
-        if not attempts[selected_idx][0].accepted:
-            selected_idx = attempts.index(best)
-
-        selected_record, selected_judge, selected_report, selected_dir = attempts[selected_idx]
+        best_record, best_judge, best_report, best_dir = _best_attempt(attempts)
         output_dir.mkdir(parents=True, exist_ok=True)
-        for item in output_dir.glob("*"):
-            if item.is_file():
-                item.unlink()
-        for src in selected_dir.glob("*"):
-            if src.is_file():
-                shutil.copy2(src, output_dir / src.name)
-
-        selected_report.outputs = [str(output_dir / src.name) for src in sorted(selected_dir.glob("view_*.png"))]
-        selected_report.source = str(input_path)
-        selected_report.save(output_dir / "manifest.json")
+        if best_dir.exists():
+            if output_dir.exists():
+                shutil.rmtree(output_dir)
+            shutil.copytree(best_dir, output_dir)
+        best_report.outputs = [str(p) for p in sorted(output_dir.glob("*.png"))]
+        best_report.ok = best_judge.verdict in {"PASS", "WARN"}
+        best_report.save(output_dir / "split.report.json")
         summary = FallbackSummary(
             operation="split-sheet",
             source=str(input_path),
             target=str(output_dir),
-            selected_attempt=selected_record.name,
-            selected_verdict=selected_judge.verdict,
-            selected_score=selected_judge.score,
-            accepted=selected_record.accepted,
+            selected_attempt=best_record.name,
+            selected_verdict=best_judge.verdict,
+            selected_score=best_judge.score,
+            accepted=best_record.accepted,
             attempts=[a[0] for a in attempts],
         )
-        summary.save(output_dir / "fallback.json")
-        return selected_report, summary
+        summary.save(output_dir / "split.fallback.json")
+        return best_report, summary
 
 
-def extract_items_with_retry(
+def extract_items_with_fallback(
     input_path: str | Path,
     output_dir: str | Path,
-    padding: int = 16,
-    min_area: int = 120,
-    merge_distance: int = 12,
-    square_canvas: bool = False,
-    normalize: int | None = None,
-    transparent_bg: bool = False,
-    threshold: float = 28.0,
-    debug: bool = False,
-    accept_verdict: str = "PASS",
-    min_score: float = 85.0,
-    min_count: int = 1,
+    min_score: float = 70.0,
 ) -> tuple[OperationReport, FallbackSummary]:
     output_dir = Path(output_dir)
-    candidates = [
-        {"threshold": threshold, "min_area": min_area, "merge_distance": merge_distance},
-        {"threshold": max(8.0, threshold - 8.0), "min_area": max(32, min_area // 2), "merge_distance": merge_distance},
-        {"threshold": threshold + 8.0, "min_area": min_area, "merge_distance": merge_distance * 2},
-        {"threshold": threshold, "min_area": max(16, min_area // 4), "merge_distance": merge_distance + 16},
-    ]
-
     attempts: list[tuple[AttemptRecord, QualityReport, OperationReport, Path]] = []
-    selected_idx = 0
-    with TemporaryDirectory(prefix="imagehandler_extract_retry_") as tmpdir:
+    settings = [
+        {"padding": 8, "min_area": 256},
+        {"padding": 12, "min_area": 128},
+        {"padding": 16, "min_area": 64},
+    ]
+    with TemporaryDirectory(prefix="imagehandler_items_retry_") as tmpdir:
         tmp_root = Path(tmpdir)
-        for idx, cfg in enumerate(candidates, start=1):
+        for idx, cfg in enumerate(settings, start=1):
             attempt_dir = tmp_root / f"attempt_{idx:02d}"
-            report = extract_items(
-                input_path=input_path,
-                output_dir=attempt_dir,
-                padding=padding,
-                min_area=cfg["min_area"],
-                merge_distance=cfg["merge_distance"],
-                square_canvas=square_canvas,
-                normalize=normalize,
-                transparent_bg=transparent_bg,
-                threshold=cfg["threshold"],
-                debug=debug,
-            )
-            judge = judge_directory(attempt_dir, task="extract-items", min_count=min_count, alpha_required=transparent_bg)
-            accepted = _is_acceptable(judge, accept_verdict, min_score)
+            try:
+                report = extract_items(input_path, attempt_dir, **cfg)
+                judge = judge_directory(attempt_dir, task="extract-items")
+            except Exception as exc:
+                report = OperationReport(ok=False, operation="extract-items", source=str(input_path))
+                judge = QualityReport(
+                    ok=False,
+                    verdict="FAIL",
+                    score=0.0,
+                    task="extract-items",
+                    target=str(attempt_dir),
+                    failures=[f"attempt runtime error: {exc}"],
+                )
+            accepted = judge.verdict in {"PASS", "WARN"} and judge.score >= min_score
             record = AttemptRecord(
-                name=f"strategy:{idx}",
+                name=f"extract:{cfg}",
                 verdict=judge.verdict,
                 score=judge.score,
                 accepted=accepted,
@@ -398,34 +378,26 @@ def extract_items_with_retry(
             )
             attempts.append((record, judge, report, attempt_dir))
             if accepted:
-                selected_idx = len(attempts) - 1
                 break
 
-        best = _best_attempt(attempts)
-        if not attempts[selected_idx][0].accepted:
-            selected_idx = attempts.index(best)
-
-        selected_record, selected_judge, selected_report, selected_dir = attempts[selected_idx]
+        best_record, best_judge, best_report, best_dir = _best_attempt(attempts)
         output_dir.mkdir(parents=True, exist_ok=True)
-        for item in output_dir.glob("*"):
-            if item.is_file():
-                item.unlink()
-        for src in selected_dir.glob("*"):
-            if src.is_file():
-                shutil.copy2(src, output_dir / src.name)
-
-        selected_report.outputs = [str(output_dir / src.name) for src in sorted(selected_dir.glob("item_*.png"))]
-        selected_report.source = str(input_path)
-        selected_report.save(output_dir / "manifest.json")
+        if best_dir.exists():
+            if output_dir.exists():
+                shutil.rmtree(output_dir)
+            shutil.copytree(best_dir, output_dir)
+        best_report.outputs = [str(p) for p in sorted(output_dir.glob("*.png"))]
+        best_report.ok = best_judge.verdict in {"PASS", "WARN"}
+        best_report.save(output_dir / "items.report.json")
         summary = FallbackSummary(
             operation="extract-items",
             source=str(input_path),
             target=str(output_dir),
-            selected_attempt=selected_record.name,
-            selected_verdict=selected_judge.verdict,
-            selected_score=selected_judge.score,
-            accepted=selected_record.accepted,
+            selected_attempt=best_record.name,
+            selected_verdict=best_judge.verdict,
+            selected_score=best_judge.score,
+            accepted=best_record.accepted,
             attempts=[a[0] for a in attempts],
         )
-        summary.save(output_dir / "fallback.json")
-        return selected_report, summary
+        summary.save(output_dir / "items.fallback.json")
+        return best_report, summary
