@@ -56,6 +56,8 @@ def remove_background(
     feather: float = 0.0,
     cleanup_mode: str = "safe",
     head_refine: bool = True,
+    bisenet_onnx: str | Path | None = None,
+    head_debug: bool = False,
 ) -> OperationReport:
     source_image = load_image(input_path, "RGBA")
     output = Path(output_path)
@@ -66,6 +68,7 @@ def remove_background(
     warnings: list[str] = []
     critical_failure = False
     head_metrics: dict[str, Any] = {}
+    head_debug_images: dict[str, Image.Image] = {}
 
     if selected_backend == "rembg":
         rembg_model = normalize_rembg_model(model)
@@ -95,17 +98,18 @@ def remove_background(
         )
         soft_alpha = _clip_soft_alpha_to_support(soft_alpha, refined_support)
 
-        # Face/head refinement is ON by default. It prefers MediaPipe FaceMesh
-        # when installed, and otherwise falls back to a head-local heuristic.
-        # Only head-local background-colored pixels connected to ROI borders are
-        # removed, avoiding global white cleanup that can damage clothing.
+        # Face/head refinement is ON by default. It prefers BiSeNet ONNX when
+        # configured, then MediaPipe FaceMesh. Heuristic fallback is metrics-only.
         head_result = refine_head_alpha_with_face_priority(
             source_image,
             soft_alpha,
             enabled=head_refine,
+            bisenet_onnx_path=bisenet_onnx,
+            debug=head_debug,
         )
         soft_alpha = head_result.alpha
         head_metrics = head_result.metrics
+        head_debug_images = head_result.debug_images
 
         soft_alpha = smooth_alpha_edges(soft_alpha, radius=0.65)
         rgba = _apply_soft_alpha(rgba, soft_alpha)
@@ -159,7 +163,8 @@ def remove_background(
         rgba.save(output)
         _save_alpha_matte(soft_alpha, mask_path)
         preview_outputs = save_alpha_previews(rgba, output)
-        outputs = [str(output), str(mask_path), *preview_outputs]
+        head_debug_outputs = _save_head_debug_images(head_debug_images, output)
+        outputs = [str(output), str(mask_path), *preview_outputs, *head_debug_outputs]
 
     bbox = bbox_from_mask(mask)
     report = OperationReport(
@@ -215,6 +220,18 @@ def _clip_soft_alpha_to_support(alpha: np.ndarray, support: np.ndarray) -> np.nd
 def _save_alpha_matte(alpha: np.ndarray, path: str | Path) -> None:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     Image.fromarray(np.clip(alpha, 0, 255).astype(np.uint8), mode="L").save(path)
+
+
+def _save_head_debug_images(debug_images: dict[str, Image.Image], output: Path) -> list[str]:
+    if not debug_images:
+        return []
+    paths: list[str] = []
+    for name, image in debug_images.items():
+        safe_name = name.replace("/", ".").replace("\\", ".")
+        path = output.with_name(f"{output.stem}.{safe_name}.png")
+        image.save(path)
+        paths.append(str(path))
+    return paths
 
 
 def _remove_with_rembg(
