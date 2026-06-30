@@ -8,6 +8,7 @@ PYTHON_BIN_FILE="$ROOT_DIR/.python-bin"
 ENV_FILE="$ROOT_DIR/.imagehandler-env"
 WORKSPACE_DIR="${WORKSPACE_DIR:-$ROOT_DIR/workspace}"
 MODE="cpu"
+WITH_HEAD=1
 WITH_TRANSPARENT=0
 WITH_MATTING=0
 WITH_DEV=0
@@ -45,25 +46,25 @@ Options:
   --python 3.14      Preferred Python version or executable. Default: auto.
   --cpu              Install CPU background-removal stack. Default.
   --gpu              Install NVIDIA/CUDA rembg GPU stack.
+  --head             Install MediaPipe FaceMesh dependency. Default.
+  --no-head          Skip MediaPipe install; head refinement falls back to heuristic.
   --transparent      Also install transparent-background backend.
   --matting          Also install pymatting backend.
   --dev              Also install pytest and ruff.
-  --all              Install CPU stack plus transparent, matting, and dev tools.
+  --all              Install CPU stack plus head, transparent, matting, and dev tools.
   --no-venv          Install into the current Python environment.
   --skip-smoke       Skip smoke tests after installation.
   --workspace DIR    Create workspace folders under DIR. Default: ./workspace
-  --check-only       Only check Python and system dependency state.
+  --check-only       Only check Python and venv state.
   --fix-owner        Fix local project ownership if previous sudo runs created root-owned files.
   -h, --help         Show this help.
 
 Python policy:
   Python 3.11 through 3.14 is accepted.
-  If --python is given, an existing .venv with a different Python minor version
-  is not reused; it is moved aside and recreated.
 
 Important:
-  This script never relies on shell activation or PATH python after venv setup.
-  It always executes the exact venv interpreter: .venv/bin/python.
+  This script does not install OS packages. If OpenCV import fails on Linux/WSL,
+  install system runtime libraries separately, then rerun this script.
 
 Recommended:
   ./setup.sh
@@ -80,10 +81,12 @@ while [[ $# -gt 0 ]]; do
       ;;
     --cpu) MODE="cpu" ;;
     --gpu) MODE="gpu" ;;
+    --head) WITH_HEAD=1 ;;
+    --no-head) WITH_HEAD=0 ;;
     --transparent) WITH_TRANSPARENT=1 ;;
     --matting) WITH_MATTING=1 ;;
     --dev) WITH_DEV=1 ;;
-    --all) WITH_TRANSPARENT=1; WITH_MATTING=1; WITH_DEV=1; MODE="cpu" ;;
+    --all) WITH_HEAD=1; WITH_TRANSPARENT=1; WITH_MATTING=1; WITH_DEV=1; MODE="cpu" ;;
     --no-venv) USE_VENV=0 ;;
     --skip-smoke) SKIP_SMOKE=1 ;;
     --workspace)
@@ -106,13 +109,13 @@ if [[ "$IS_MAC" -eq 1 ]]; then
 fi
 
 if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
-  warn "Running setup with sudo/root is not recommended. Run './setup.sh' as your normal user."
+  warn "Running setup as root is not recommended."
 fi
 
 if [[ "$FIX_OWNER" -eq 1 ]]; then
   owner="${SUDO_USER:-$(whoami)}"
   log "Fixing project ownership for $owner"
-  sudo chown -R "$owner" "$ROOT_DIR" 2>/dev/null || warn "chown failed or not needed"
+  chown -R "$owner" "$ROOT_DIR" 2>/dev/null || warn "chown failed or not needed"
 fi
 
 python_version_ok() {
@@ -140,49 +143,25 @@ PY
 python_matches_preferred() {
   local py="$1"
   [[ -z "$PREFERRED_PYTHON" ]] && return 0
-
   if [[ "$PREFERRED_PYTHON" == */* ]]; then
     [[ "$py" == "$PREFERRED_PYTHON" ]] && return 0
     return 1
   fi
-
   [[ "$(python_minor_text "$py")" == "$PREFERRED_PYTHON" ]]
 }
 
-resolve_python_bin_file() {
-  [[ -z "$PREFERRED_PYTHON" ]] || return 1
-  if [[ ! -f "$PYTHON_BIN_FILE" ]]; then
-    return 1
-  fi
-  local p
-  p="$(tr -d '\r\n' < "$PYTHON_BIN_FILE")"
-  [[ -n "$p" ]] || return 1
-  if ([[ -x "$p" ]] || command -v "$p" >/dev/null 2>&1) && python_version_ok "$p"; then
-    command -v "$p" 2>/dev/null || printf '%s\n' "$p"
-    return 0
-  fi
-  return 1
-}
-
 find_python() {
-  # If --python is not specified, existing venv is the source of truth.
   if [[ -z "$PREFERRED_PYTHON" && "$USE_VENV" -eq 1 && -x "$VENV_PY" ]] && python_version_ok "$VENV_PY"; then
     printf '%s\n' "$VENV_PY"
     return
   fi
 
   if [[ -n "$PYTHON_BIN" ]]; then
-    if ([[ -x "$PYTHON_BIN" ]] || command -v "$PYTHON_BIN" >/dev/null 2>&1) && python_version_ok "$PYTHON_BIN"; then
-      if python_matches_preferred "$PYTHON_BIN"; then
-        command -v "$PYTHON_BIN" 2>/dev/null || printf '%s\n' "$PYTHON_BIN"
-        return
-      fi
+    if ([[ -x "$PYTHON_BIN" ]] || command -v "$PYTHON_BIN" >/dev/null 2>&1) && python_version_ok "$PYTHON_BIN" && python_matches_preferred "$PYTHON_BIN"; then
+      command -v "$PYTHON_BIN" 2>/dev/null || printf '%s\n' "$PYTHON_BIN"
+      return
     fi
     fail "PYTHON_BIN is not a matching supported Python executable: $PYTHON_BIN"
-  fi
-
-  if resolve_python_bin_file; then
-    return
   fi
 
   local candidates=()
@@ -200,32 +179,17 @@ find_python() {
 
   local p
   for p in "${candidates[@]}"; do
-    if ([[ -x "$p" ]] || command -v "$p" >/dev/null 2>&1) && python_version_ok "$p"; then
-      if python_matches_preferred "$p"; then
-        command -v "$p" 2>/dev/null || printf '%s\n' "$p"
-        return
-      fi
+    if ([[ -x "$p" ]] || command -v "$p" >/dev/null 2>&1) && python_version_ok "$p" && python_matches_preferred "$p"; then
+      command -v "$p" 2>/dev/null || printf '%s\n' "$p"
+      return
     fi
   done
-}
-
-install_linux_runtime_deps() {
-  [[ "$IS_LINUX" -eq 1 ]] || return
-  command -v apt-get >/dev/null 2>&1 || return
-  command -v sudo >/dev/null 2>&1 || return
-
-  log "Installing Linux/WSL runtime dependencies if needed"
-  sudo apt-get update
-  sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-    ca-certificates git build-essential pkg-config \
-    libgl1 libglib2.0-0 libsm6 libxext6 libxrender1
 }
 
 archive_venv() {
   if [[ ! -d "$VENV_DIR" ]]; then
     return
   fi
-  local backup
   backup="$ROOT_DIR/.venv.invalid.$(date +%Y%m%d_%H%M%S)"
   warn "Moving existing venv to: $backup"
   mv "$VENV_DIR" "$backup"
@@ -235,13 +199,11 @@ archive_bad_or_mismatched_venv_if_needed() {
   if [[ ! -x "$VENV_PY" ]]; then
     return
   fi
-
   if ! python_version_ok "$VENV_PY"; then
     warn "Existing venv Python is unsupported: $(python_version_text "$VENV_PY")"
     archive_venv
     return
   fi
-
   if [[ -n "$PREFERRED_PYTHON" ]] && ! python_matches_preferred "$VENV_PY"; then
     warn "Existing venv Python $(python_minor_text "$VENV_PY") does not match requested --python $PREFERRED_PYTHON"
     archive_venv
@@ -254,19 +216,18 @@ if [[ "$IS_WSL" -eq 1 ]]; then
 fi
 
 if [[ "$IS_MAC" -eq 1 && "$MODE" == "gpu" ]]; then
-  warn "macOS does not use the rembg NVIDIA/CUDA GPU path. Falling back to --cpu."
+  warn "macOS does not use NVIDIA/CUDA rembg GPU path. Falling back to --cpu."
   MODE="cpu"
 fi
 
 archive_bad_or_mismatched_venv_if_needed
-install_linux_runtime_deps || warn "Linux runtime dependency install skipped or failed; continuing."
 
 PY="$(find_python || true)"
 if [[ -z "$PY" ]]; then
   if [[ -n "$PREFERRED_PYTHON" ]]; then
-    fail "Requested Python $PREFERRED_PYTHON was not found. Use ./setup.sh with no --python to use an available Python, or install python$PREFERRED_PYTHON."
+    fail "Requested Python $PREFERRED_PYTHON was not found. Use ./setup.sh with no --python to use an available Python."
   fi
-  fail "Python 3.11-3.14 was not found. Install Python or run with --python /path/to/python."
+  fail "Python 3.11-3.14 was not found."
 fi
 
 log "Using base Python: $PY ($(python_version_text "$PY"))"
@@ -302,22 +263,33 @@ else
   log "Using current/base Python without venv: $PY"
 fi
 
+install_packages() {
+  log "Installing: $*"
+  "$PY" -m pip install "$@"
+}
+
+install_optional_packages() {
+  log "Installing optional: $*"
+  if ! "$PY" -m pip install "$@"; then
+    warn "Optional install failed: $*. Continuing without it."
+  fi
+}
+
 log "Upgrading packaging tools"
 "$PY" -m pip install --upgrade pip setuptools wheel
 
 log "Installing imagehandler package"
 "$PY" -m pip install -e .
 
-install_packages() {
-  log "Installing: $*"
-  "$PY" -m pip install "$@"
-}
-
 case "$MODE" in
   cpu) install_packages "rembg[cpu]>=2.0.0" ;;
   gpu) install_packages "rembg[gpu]>=2.0.0" ;;
   *) fail "Invalid install mode: $MODE" ;;
 esac
+
+if [[ "$WITH_HEAD" -eq 1 ]]; then
+  install_optional_packages "mediapipe>=0.10.14"
+fi
 
 if [[ "$WITH_TRANSPARENT" -eq 1 ]]; then
   install_packages "transparent-background>=1.3.4"
@@ -345,6 +317,11 @@ for module in required:
         missing.append(module)
 if missing:
     raise SystemExit(1)
+try:
+    importlib.import_module("mediapipe")
+    print("OK optional: mediapipe")
+except Exception as exc:
+    print(f"WARN optional: mediapipe unavailable -> {exc}")
 PY
 
 if [[ "$SKIP_SMOKE" -eq 0 ]]; then
@@ -352,7 +329,6 @@ if [[ "$SKIP_SMOKE" -eq 0 ]]; then
   "$PY" - <<'PY'
 from pathlib import Path
 from PIL import Image, ImageDraw
-
 from imagehandler.bg_remove import remove_background
 from imagehandler.extract_items import extract_items
 from imagehandler.split_sheet import split_sheet
