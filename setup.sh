@@ -3,6 +3,7 @@ set -Eeuo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="${VENV_DIR:-$ROOT_DIR/.venv}"
+VENV_PY="$VENV_DIR/bin/python"
 PYTHON_BIN_FILE="$ROOT_DIR/.python-bin"
 ENV_FILE="$ROOT_DIR/.imagehandler-env"
 WORKSPACE_DIR="${WORKSPACE_DIR:-$ROOT_DIR/workspace}"
@@ -59,6 +60,10 @@ Python policy:
   Python 3.11 through 3.14 is accepted.
   If --python is given, an existing .venv with a different Python minor version
   is not reused; it is moved aside and recreated.
+
+Important:
+  This script never relies on shell activation or PATH python after venv setup.
+  It always executes the exact venv interpreter: .venv/bin/python.
 
 Recommended:
   ./setup.sh
@@ -132,10 +137,6 @@ print(f"{sys.version_info.major}.{sys.version_info.minor}")
 PY
 }
 
-preferred_is_version() {
-  [[ -n "$PREFERRED_PYTHON" && "$PREFERRED_PYTHON" != */* ]]
-}
-
 python_matches_preferred() {
   local py="$1"
   [[ -z "$PREFERRED_PYTHON" ]] && return 0
@@ -165,8 +166,8 @@ resolve_python_bin_file() {
 
 find_python() {
   # If --python is not specified, existing venv is the source of truth.
-  if [[ -z "$PREFERRED_PYTHON" && "$USE_VENV" -eq 1 && -x "$VENV_DIR/bin/python" ]] && python_version_ok "$VENV_DIR/bin/python"; then
-    printf '%s\n' "$VENV_DIR/bin/python"
+  if [[ -z "$PREFERRED_PYTHON" && "$USE_VENV" -eq 1 && -x "$VENV_PY" ]] && python_version_ok "$VENV_PY"; then
+    printf '%s\n' "$VENV_PY"
     return
   fi
 
@@ -231,18 +232,18 @@ archive_venv() {
 }
 
 archive_bad_or_mismatched_venv_if_needed() {
-  if [[ ! -x "$VENV_DIR/bin/python" ]]; then
+  if [[ ! -x "$VENV_PY" ]]; then
     return
   fi
 
-  if ! python_version_ok "$VENV_DIR/bin/python"; then
-    warn "Existing venv Python is unsupported: $(python_version_text "$VENV_DIR/bin/python")"
+  if ! python_version_ok "$VENV_PY"; then
+    warn "Existing venv Python is unsupported: $(python_version_text "$VENV_PY")"
     archive_venv
     return
   fi
 
-  if [[ -n "$PREFERRED_PYTHON" ]] && ! python_matches_preferred "$VENV_DIR/bin/python"; then
-    warn "Existing venv Python $(python_minor_text "$VENV_DIR/bin/python") does not match requested --python $PREFERRED_PYTHON"
+  if [[ -n "$PREFERRED_PYTHON" ]] && ! python_matches_preferred "$VENV_PY"; then
+    warn "Existing venv Python $(python_minor_text "$VENV_PY") does not match requested --python $PREFERRED_PYTHON"
     archive_venv
   fi
 }
@@ -268,7 +269,7 @@ if [[ -z "$PY" ]]; then
   fail "Python 3.11-3.14 was not found. Install Python or run with --python /path/to/python."
 fi
 
-log "Using Python: $PY ($(python_version_text "$PY"))"
+log "Using base Python: $PY ($(python_version_text "$PY"))"
 printf '%s\n' "$PY" > "$PYTHON_BIN_FILE"
 cat > "$ENV_FILE" <<EOF
 export PYTHON_BIN="$PY"
@@ -280,7 +281,7 @@ if [[ "$CHECK_ONLY" -eq 1 ]]; then
 fi
 
 if [[ "$USE_VENV" -eq 1 ]]; then
-  if [[ "$PY" == "$VENV_DIR/bin/python" ]]; then
+  if [[ "$PY" == "$VENV_PY" ]]; then
     log "Using existing virtual environment: $VENV_DIR"
   else
     if [[ ! -d "$VENV_DIR" ]]; then
@@ -293,9 +294,12 @@ if [[ "$USE_VENV" -eq 1 ]]; then
       "$PY" -m venv "$VENV_DIR"
     fi
   fi
-  source "$VENV_DIR/bin/activate"
-  PY="python"
-  python_version_ok "$PY" || fail "Activated venv Python is unsupported: $(python_version_text "$PY")"
+  [[ -x "$VENV_PY" ]] || fail "venv Python was not created: $VENV_PY"
+  python_version_ok "$VENV_PY" || fail "venv Python is unsupported: $(python_version_text "$VENV_PY")"
+  PY="$VENV_PY"
+  log "Using venv Python directly: $PY ($(python_version_text "$PY"))"
+else
+  log "Using current/base Python without venv: $PY"
 fi
 
 log "Upgrading packaging tools"
