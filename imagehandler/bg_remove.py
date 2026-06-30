@@ -61,6 +61,7 @@ def remove_background(
     selected_backend = _select_backend(backend)
     backend_label = selected_backend
     warnings: list[str] = []
+    critical_failure = False
 
     if selected_backend == "rembg":
         rembg_model = normalize_rembg_model(model)
@@ -100,7 +101,10 @@ def remove_background(
         soft_alpha = _extract_alpha(rgba)
         support_mask = soft_alpha > 8
 
-    rgba = zero_transparent_rgb(rgba)
+    # Treat near-transparent pixels as transparent for RGB cleanup too. This
+    # prevents tiny alpha remnants from carrying black/white matte colors into
+    # game-engine previews while preserving their alpha values for diagnostics.
+    rgba = zero_transparent_rgb(rgba, alpha_threshold=8)
     soft_alpha = _extract_alpha(rgba)
     mask = soft_alpha > 8
 
@@ -110,8 +114,10 @@ def remove_background(
 
     if metrics["foreground_area_ratio"] < 0.005:
         warnings.append("Foreground mask is extremely small.")
+        critical_failure = True
     if metrics["foreground_area_ratio"] > 0.98:
         warnings.append("Foreground mask covers almost the entire image.")
+        critical_failure = True
     if metrics["touches_border"]:
         warnings.append("Foreground touches image border; crop may be incomplete.")
     if alpha_metrics["transparent_rgb_leak_ratio"] > 0.001:
@@ -139,7 +145,7 @@ def remove_background(
 
     bbox = bbox_from_mask(mask)
     report = OperationReport(
-        ok=len(warnings) == 0,
+        ok=not critical_failure,
         operation="remove-bg",
         source=str(input_path),
         backend=backend_label,
