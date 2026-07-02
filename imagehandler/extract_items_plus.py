@@ -255,3 +255,61 @@ def _box_from_local_mask(local: np.ndarray, region_box: BBox) -> BBox | None:
         region_box.left + int(xs.max()) + 1,
         region_box.top + int(ys.max()) + 1,
     )
+
+
+def _split_box_recursive(
+    mask: np.ndarray,
+    box: BBox,
+    image_width: int,
+    image_height: int,
+    min_area: int,
+    depth: int = 0,
+) -> tuple[list[BBox], int]:
+    if depth >= 4 or box.area < max(min_area * 4, 1024):
+        return [box], 0
+    local = mask[box.top : box.bottom, box.left : box.right].astype(bool)
+    if not local.any():
+        return [], 0
+    candidate = _best_gap(local)
+    if candidate is None:
+        return [box], 0
+    axis, start, end = candidate
+    if axis == "h":
+        slabs = [BBox(box.left, box.top, box.right, box.top + start), BBox(box.left, box.top + end, box.right, box.bottom)]
+    else:
+        slabs = [BBox(box.left, box.top, box.left + start, box.bottom), BBox(box.left + end, box.top, box.right, box.bottom)]
+    pieces: list[BBox] = []
+    for slab in slabs:
+        sub = mask[slab.top : slab.bottom, slab.left : slab.right].astype(bool)
+        if int(sub.sum()) < min_area:
+            continue
+        ys, xs = np.where(sub)
+        trimmed = BBox(slab.left + int(xs.min()), slab.top + int(ys.min()), slab.left + int(xs.max()) + 1, slab.top + int(ys.max()) + 1)
+        parts, count = _split_box_recursive(mask, trimmed, image_width, image_height, min_area, depth + 1)
+        pieces.extend(parts)
+    if len(pieces) < 2:
+        return [box], 0
+    return pieces, 1
+
+
+def _best_gap(local: np.ndarray) -> tuple[str, int, int] | None:
+    h, w = local.shape
+    candidates: list[tuple[str, int, int, float]] = []
+    for axis, counts, cross, length in (("h", local.sum(axis=1), w, h), ("v", local.sum(axis=0), h, w)):
+        low = max(1, int(cross * 0.01))
+        empty = counts <= low
+        start = None
+        margin = max(4, int(length * 0.03))
+        min_gap = max(4, int(length * 0.01))
+        for idx, val in enumerate(empty.tolist() + [False]):
+            if val and start is None:
+                start = idx
+            elif not val and start is not None:
+                end = idx
+                if start >= margin and end <= length - margin and end - start >= min_gap:
+                    candidates.append((axis, start, end, float(end - start) / max(1, length)))
+                start = None
+    if not candidates:
+        return None
+    axis, start, end, _score = max(candidates, key=lambda item: item[3])
+    return axis, start, end
