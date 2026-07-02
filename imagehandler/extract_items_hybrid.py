@@ -113,6 +113,14 @@ def extract_items(
         min_area,
     )
     split_count += final_splits
+    boxes, parent_decomposition_info = _decompose_broad_parents_with_sam(
+        mask=support_mask,
+        boxes=boxes,
+        sam_masks=sam_masks,
+        image_width=width,
+        image_height=height,
+        min_area=min_area,
+    )
     boxes = sort_boxes_reading_order(_dedupe_boxes(boxes))
 
     item_masks, assignment_info = _assign_instance_masks(
@@ -159,7 +167,7 @@ def extract_items(
         ok=len(warnings) == 0,
         operation="extract-items",
         source=str(source),
-        mode="hybrid-alpha-support-rgb-core-final-refine-sam-mask-proposals",
+        mode="hybrid-alpha-support-rgb-core-final-refine-sam-mask-proposals-parent-decompose",
         warnings=warnings,
         metrics={
             "items": len(boxes),
@@ -171,6 +179,11 @@ def extract_items(
             "sam_masks": len(sam_masks),
             "sam_raw_masks": sam_info.get("raw_masks", 0),
             "sam_status": sam_info.get("status"),
+            "sam_parent_candidates": parent_decomposition_info["parent_candidates"],
+            "sam_parent_decomposed": parent_decomposition_info["parents_decomposed"],
+            "sam_child_boxes_added": parent_decomposition_info["child_boxes_added"],
+            "sam_parent_residual_boxes": parent_decomposition_info["residual_boxes_added"],
+            "sam_parent_boxes_removed": parent_decomposition_info["parent_boxes_removed"],
             "recursive_splits": split_count,
             "coverage_recovered_components": recovery_count,
             "pruned_parent_boxes": pruned_parent_boxes,
@@ -368,6 +381,208 @@ def _is_sam_box_too_broad(box: BBox, image_width: int, image_height: int, image_
     if box.height > image_height * 0.88 and box.width > image_width * 0.42:
         return True
     return False
+
+
+def _decompose_broad_parents_with_sam(
+    mask: np.ndarray,
+    boxes: list[BBox],
+    sam_masks: list[np.ndarray],
+    image_width: int,
+    image_height: int,
+    min_area: int,
+) -> tuple[list[BBox], dict[str, int]]:
+    info = {
+        "parent_candidates": 0,
+        "parents_decomposed": 0,
+        "child_boxes_added": 0,
+        "residual_boxes_added": 0,
+        "parent_boxes_removed": 0,
+    }
+    if not sam_masks or not boxes:
+        return boxes, info
+
+    result: list[BBox] = []
+    support = mask.astype(bool)
+    for parent in boxes:
+        if not _is_broad_parent_for_sam_decompose(parent, image_width, image_height):
+            result.append(parent)
+            continue
+
+        parent_mask = np.zeros_like(support, dtype=bool)
+        parent_mask[parent.top : parent.bottom, parent.left : parent.right] = support[parent.top : parent.bottom, parent.left : parent.right]
+        parent_pixels = int(parent_mask.sum())
+        if parent_pixels < max(min_area * 4, 600):
+            result.append(parent)
+            continue
+
+        info["parent_candidates"] += 1
+        children = _sam_children_inside_parent(
+            parent=parent,
+            parent_mask=parent_mask,
+            parent_pixels=parent_pixels,
+            sam_masks=sam_masks,
+            support_mask=support,
+            min_area=min_area,
+        )
+        if len(children) < 2:
+            result.append(parent)
+            continue
+
+        child_union = np.zeros_like(support, dtype=bool)
+        child_boxes: list[BBox] = []
+        for child_box, child_mask, _score in children:
+            child_union |= child_mask
+            child_boxes.append(child_box)
+
+        child_pixels = int((child_union & parent_mask).sum())
+        child_coverage = child_pixels / max(1, parent_pixels)
+        if child_coverage < 0.30:
+            result.append(parent)
+            continue
+
+        residual_mask = parent_mask & ~_dilate_bool(child_union, 3)
+        residual_pixels = int(residual_mask.sum())
+        residual_boxes: list[BBox] = []
+        if residual_pixels >= max(min_area * 2, int(parent_pixels * 0.16)):
+            residual_boxes = _boxes_from_bool_mask(
+                residual_mask,
+                min_area=max(min_area, int(parent_pixels * 0.04)),
+                min_size=5,
+            )
+            residual_boxes = [box for box in residual_boxes if box.area < parent.area * 0.92]
+
+        if not child_boxes:
+            result.append(parent)
+            continue
+        if len(child_boxes) + len(residual_boxes) < 2:
+            result.append(parent)
+            continue
+
+        result.extend(child_boxes)
+        result.extend(residual_boxes)
+        info["parents_decomposed"] += 1
+        info["child_boxes_added"] += len(child_boxes)
+        info["residual_boxes_added"] += len(residual_boxes)
+        if not residual_boxes:
+            info["parent_boxes_removed"] += 1
+
+    return _dedupe_boxes(result), info
+
+
+def _is_broad_parent_for_sam_decompose(box: BBox, image_width: int, image_height: int) -> bool:
+    image_area = max(1, image_width * image_height)
+    area_ratio = box.area / image_area
+    if area_ratio < 0.055:
+        return False
+    if area_ratio > 0.24:
+        return True
+    if box.height > image_height * 0.30 and box.width > image_width * 0.10:
+        return True
+    if box.width > image_width * 0.28 and box.height > image_height * 0.12:
+        return True
+    if box.height > box.width * 1.35 and box.height > image_height * 0.18:
+        return True
+    if box.width > box.height * 2.0 and box.width > image_width * 0.22:
+        return True
+    return False
+
+
+def _sam_children_inside_parent(
+    parent: BBox,
+    parent_mask: np.ndarray,
+    parent_pixels: int,
+    sam_masks: list[np.ndarray],
+    support_mask: np.ndarray,
+    min_area: int,
+) -> list[tuple[BBox, np.ndarray, float]]:
+    candidates: list[tuple[BBox, np.ndarray, float]] = []
+    for proposal in sam_masks:
+        sam = proposal.astype(bool) & support_mask
+        sam_pixels = int(sam.sum())
+        if sam_pixels <= 0:
+            continue
+        overlap = sam & parent_mask
+        overlap_pixels = int(overlap.sum())
+        if overlap_pixels < max(min_area, int(parent_pixels * 0.035)):
+            continue
+        overlap_to_sam = overlap_pixels / max(1, sam_pixels)
+        overlap_to_parent = overlap_pixels / max(1, parent_pixels)
+        if overlap_to_sam < 0.78:
+            continue
+        if overlap_to_parent > 0.68:
+            continue
+
+        ys, xs = np.where(overlap)
+        child_box = BBox(int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+        if child_box.area >= parent.area * 0.72:
+            continue
+        if _contained_ratio(child_box, parent) < 0.72:
+            continue
+        if _iou(child_box, parent) > 0.72:
+            continue
+        if not _is_plausible_sam_child(parent, child_box):
+            continue
+
+        contained = _contained_ratio(child_box, parent)
+        size_ratio = overlap_pixels / max(1, parent_pixels)
+        edge_score = _child_edge_score(parent, child_box)
+        score = overlap_to_sam * 2.2 + contained * 1.2 + edge_score + size_ratio * 0.7
+        candidates.append((child_box, overlap.astype(bool), float(score)))
+
+    candidates.sort(key=lambda item: item[2], reverse=True)
+    selected: list[tuple[BBox, np.ndarray, float]] = []
+    selected_union = np.zeros_like(parent_mask, dtype=bool)
+    for child_box, child_mask, score in candidates:
+        if len(selected) >= 8:
+            break
+        duplicate = False
+        for selected_box, selected_mask, _selected_score in selected:
+            mask_iou = _mask_iou(child_mask, selected_mask)
+            if mask_iou > 0.62 or _iou(child_box, selected_box) > 0.72:
+                duplicate = True
+                break
+        if duplicate:
+            continue
+        new_pixels = int((child_mask & ~selected_union).sum())
+        if new_pixels < max(min_area, int(parent_pixels * 0.025)):
+            continue
+        selected.append((child_box, child_mask, score))
+        selected_union |= child_mask
+    return selected
+
+
+def _is_plausible_sam_child(parent: BBox, child: BBox) -> bool:
+    return _child_edge_score(parent, child) > 0.0 or child.height > child.width * 1.25 or child.width > child.height * 1.6
+
+
+def _child_edge_score(parent: BBox, child: BBox) -> float:
+    parent_w = max(1, parent.width)
+    parent_h = max(1, parent.height)
+    cx = ((child.left + child.right) / 2.0 - parent.left) / parent_w
+    cy = ((child.top + child.bottom) / 2.0 - parent.top) / parent_h
+    score = 0.0
+    if cx < 0.32 or cx > 0.68:
+        score += 0.55
+    if cy < 0.28 or cy > 0.72:
+        score += 0.35
+    if child.left <= parent.left + parent_w * 0.08 or child.right >= parent.right - parent_w * 0.08:
+        score += 0.25
+    if child.top <= parent.top + parent_h * 0.08 or child.bottom >= parent.bottom - parent_h * 0.08:
+        score += 0.20
+    return score
+
+
+def _boxes_from_bool_mask(mask: np.ndarray, min_area: int, min_size: int) -> list[BBox]:
+    out: list[BBox] = []
+    for box, _area in components_bboxes(mask.astype(bool), min_area=min_area, min_size=min_size):
+        out.append(box)
+    return _dedupe_boxes(out)
+
+
+def _mask_iou(a: np.ndarray, b: np.ndarray) -> float:
+    inter = int((a.astype(bool) & b.astype(bool)).sum())
+    union = int((a.astype(bool) | b.astype(bool)).sum())
+    return float(inter / max(1, union))
 
 
 def _assign_instance_masks(
