@@ -6,7 +6,11 @@ from pathlib import Path
 
 import typer
 
+from imagehandler.batch import BatchResult, move_input_to_failed, move_input_to_job_input
+from imagehandler.person_clothing import separate_person_clothing
+
 from .background import batch_remove_cmd
+from .common import print_batch_result
 from .items import batch_extract_cmd
 from .sheet import batch_split_cmd
 
@@ -14,6 +18,7 @@ app = typer.Typer(help="Interactive menu launcher.", invoke_without_command=True
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
 BISENET_MODEL_REL = Path("models") / "bisenet_face_parsing.onnx"
+HUMAN_PARSING_MODEL_REL = Path("models") / "human_parsing.onnx"
 
 DEFAULT_CONFIG = {
     "profile": "balanced",
@@ -24,10 +29,7 @@ DEFAULT_CONFIG = {
         "retry_on_fail": True,
         "continue_on_error": True,
         "recursive": True,
-        "head": {
-            "mode": "mediapipe",
-            "debug": False,
-        },
+        "head": {"mode": "mediapipe", "debug": False},
     },
     "sheet": {
         "recursive": True,
@@ -55,6 +57,14 @@ DEFAULT_CONFIG = {
         "min_count": 1,
         "continue_on_error": True,
     },
+    "clothing": {
+        "recursive": True,
+        "transparent_bg": False,
+        "threshold": 28.0,
+        "debug": True,
+        "min_area": 120,
+        "continue_on_error": True,
+    },
 }
 
 PROFILES = {
@@ -62,16 +72,19 @@ PROFILES = {
         "bg": {"retry_on_fail": False, "head": {"mode": "off", "debug": False}},
         "sheet": {"debug": False, "retry_on_fail": False},
         "items": {"debug": False, "retry_on_fail": False},
+        "clothing": {"debug": False},
     },
     "balanced": {
         "bg": {"retry_on_fail": True, "head": {"mode": "mediapipe", "debug": False}},
         "sheet": {"debug": True, "retry_on_fail": True},
         "items": {"debug": True, "retry_on_fail": True},
+        "clothing": {"debug": True},
     },
     "high_quality": {
         "bg": {"retry_on_fail": True, "alpha_matting": True, "head": {"mode": "bisenet", "debug": True}},
         "sheet": {"debug": True, "retry_on_fail": True},
         "items": {"debug": True, "retry_on_fail": True},
+        "clothing": {"debug": True},
     },
 }
 
@@ -88,13 +101,13 @@ def _bisenet_model_path() -> Path:
     return _project_root() / BISENET_MODEL_REL
 
 
-def _bisenet_model_available() -> bool:
-    return _bisenet_model_path().is_file()
+def _human_parsing_model_path() -> Path:
+    return _project_root() / HUMAN_PARSING_MODEL_REL
 
 
 def _ensure_workspace() -> Path:
     root = _workspace_root()
-    for task in ["bg", "sheets", "items"]:
+    for task in ["bg", "sheets", "items", "clothing"]:
         for rel in ["input", "jobs", "failed"]:
             (root / task / rel).mkdir(parents=True, exist_ok=True)
     (root / "reports").mkdir(parents=True, exist_ok=True)
@@ -115,11 +128,8 @@ def _config_path() -> Path:
 
 
 def _normalize_config(config: dict) -> dict:
-    config.setdefault("bg", {})
-    config.setdefault("sheet", {})
-    config.setdefault("items", {})
-
-    _deep_update(config, {})
+    for section in ["bg", "sheet", "items", "clothing"]:
+        config.setdefault(section, {})
     config["bg"].setdefault("backend", "auto")
     config["bg"].setdefault("model", None)
     config["bg"].setdefault("alpha_matting", False)
@@ -129,11 +139,9 @@ def _normalize_config(config: dict) -> dict:
     config["bg"].setdefault("head", {"mode": "mediapipe", "debug": False})
     config["bg"]["head"].setdefault("mode", "mediapipe")
     config["bg"]["head"].setdefault("debug", False)
-
-    for key, value in DEFAULT_CONFIG["sheet"].items():
-        config["sheet"].setdefault(key, value)
-    for key, value in DEFAULT_CONFIG["items"].items():
-        config["items"].setdefault(key, value)
+    for section in ["sheet", "items", "clothing"]:
+        for key, value in DEFAULT_CONFIG[section].items():
+            config[section].setdefault(key, value)
     return config
 
 
@@ -178,7 +186,7 @@ def _choose(title: str, options: list[tuple[str, str]]) -> str:
 
 def _task_paths(task: str) -> tuple[Path, Path, Path]:
     root = _ensure_workspace()
-    task_dir = {"bg": "bg", "sheet": "sheets", "items": "items"}[task]
+    task_dir = {"bg": "bg", "sheet": "sheets", "items": "items", "clothing": "clothing"}[task]
     task_root = root / task_dir
     return task_root / "input", task_root / "jobs", task_root / "failed"
 
@@ -196,9 +204,10 @@ def _list_images(path: Path, recursive: bool = True) -> list[Path]:
 def _show_hint() -> None:
     root = _ensure_workspace()
     typer.echo("\nOptimized workspace. Put source files into the task input folder:")
-    typer.echo(f"  BG     : {root / 'bg' / 'input'}")
-    typer.echo(f"  Sheets : {root / 'sheets' / 'input'}")
-    typer.echo(f"  Items  : {root / 'items' / 'input'}")
+    typer.echo(f"  BG       : {root / 'bg' / 'input'}")
+    typer.echo(f"  Sheets   : {root / 'sheets' / 'input'}")
+    typer.echo(f"  Items    : {root / 'items' / 'input'}")
+    typer.echo(f"  Clothing : {root / 'clothing' / 'input'}")
     typer.echo("\nSuccess flow:")
     typer.echo(f"  {root}/<task>/input/source.png")
     typer.echo(f"  -> {root}/<task>/jobs/<job>/input/source.png")
@@ -233,9 +242,11 @@ def _show_config(config: dict) -> None:
     typer.echo(f"  Profile: {config.get('profile')}")
     typer.echo(f"  BG retry    : {config['bg']['retry_on_fail']}")
     typer.echo(f"  BG head     : mode={head.get('mode')} debug={head.get('debug')}")
-    typer.echo(f"  BiSeNet ONNX: {_bisenet_model_path()} ({'installed' if _bisenet_model_available() else 'missing'})")
+    typer.echo(f"  BiSeNet ONNX: {_bisenet_model_path()} ({'installed' if _bisenet_model_path().is_file() else 'missing'})")
+    typer.echo(f"  Human parser: {_human_parsing_model_path()} ({'installed' if _human_parsing_model_path().is_file() else 'missing'})")
     typer.echo(f"  Sheet retry : {config['sheet']['retry_on_fail']} / views={config['sheet']['views']} / recursive={config['sheet']['recursive']}")
     typer.echo(f"  Items retry : {config['items']['retry_on_fail']} / recursive={config['items']['recursive']}")
+    typer.echo(f"  Clothing    : debug={config['clothing']['debug']} / recursive={config['clothing']['recursive']}")
 
 
 def _head_settings_menu(config: dict) -> dict:
@@ -244,25 +255,10 @@ def _head_settings_menu(config: dict) -> dict:
         typer.echo("\nHead refinement settings")
         typer.echo(f"  Mode         : {head.get('mode', 'mediapipe')}")
         typer.echo(f"  Debug images : {head.get('debug', False)}")
-        typer.echo(f"  BiSeNet model: {_bisenet_model_path()} ({'installed' if _bisenet_model_available() else 'missing'})")
-        choice = _choose(
-            "Head settings",
-            [
-                ("mode", "Choose head mode: off / mediapipe / bisenet"),
-                ("debug", "Toggle head debug sidecar images"),
-                ("back", "Back"),
-            ],
-        )
+        typer.echo(f"  BiSeNet model: {_bisenet_model_path()} ({'installed' if _bisenet_model_path().is_file() else 'missing'})")
+        choice = _choose("Head settings", [("mode", "Choose head mode: off / mediapipe / bisenet"), ("debug", "Toggle head debug sidecar images"), ("back", "Back")])
         if choice == "mode":
-            mode = _choose(
-                "Head mode",
-                [
-                    ("off", "Off - no head refinement"),
-                    ("mediapipe", "MediaPipe FaceMesh ROI only"),
-                    ("bisenet", f"BiSeNet face parsing if model exists at {BISENET_MODEL_REL}"),
-                ],
-            )
-            head["mode"] = mode
+            head["mode"] = _choose("Head mode", [("off", "Off"), ("mediapipe", "MediaPipe FaceMesh ROI only"), ("bisenet", "BiSeNet face parsing")])
             _save_config(config)
         elif choice == "debug":
             head["debug"] = not bool(head.get("debug", False))
@@ -320,11 +316,44 @@ def _quick_sheet(config: dict) -> None:
 
 
 def _quick_items(config: dict) -> None:
-    input_dir, pending = _show_task_help("items", "Items / equipment-item extraction")
+    input_dir, pending = _show_task_help("items", "Items / equipment extraction")
     if not pending:
         return
     opts = config["items"]
     batch_extract_cmd(input_dir, None, _workspace_root(), opts.get("recursive", True), None, opts["padding"], opts["min_area"], opts["merge_distance"], opts["square_canvas"], opts.get("normalize_size"), opts["transparent_bg"], opts["threshold"], opts["debug"], opts["retry_on_fail"], opts["min_count"], opts["continue_on_error"])
+
+
+def _quick_clothing(config: dict) -> None:
+    input_dir, pending = _show_task_help("clothing", "Person clothing separation")
+    if not pending:
+        return
+    opts = config["clothing"]
+    result = BatchResult(operation="clothing quick-run", total=len(pending))
+    root = input_dir
+    for src in pending:
+        job_dir = _workspace_root() / "clothing" / "jobs" / src.stem
+        if job_dir.exists():
+            import datetime
+            job_dir = job_dir.with_name(f"{job_dir.name}_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}")
+        input_archive = job_dir / "input"
+        try:
+            job_dir.mkdir(parents=True, exist_ok=True)
+            input_archive.mkdir(parents=True, exist_ok=True)
+            separate_person_clothing(src, job_dir, transparent_bg=opts["transparent_bg"], debug=opts["debug"], min_area=opts["min_area"], threshold=opts["threshold"])
+            moved = move_input_to_job_input(src, root, input_archive)
+            if moved is not None:
+                result.moved_to_job_input.append(str(moved))
+            result.succeeded += 1
+            result.outputs.append(str(job_dir))
+        except Exception as exc:
+            result.failed += 1
+            result.errors.append(f"{src}: {exc}")
+            moved = move_input_to_failed(src, root)
+            if moved is not None:
+                result.moved_to_failed.append(str(moved))
+            if not opts["continue_on_error"]:
+                raise
+    print_batch_result(result)
 
 
 def _quick_menu(config: dict) -> None:
@@ -332,12 +361,14 @@ def _quick_menu(config: dict) -> None:
     bg_input, _, _ = _task_paths("bg")
     sheet_input, _, _ = _task_paths("sheet")
     items_input, _, _ = _task_paths("items")
+    clothing_input, _, _ = _task_paths("clothing")
     choice = _choose(
         "Quick run - choose task after placing files in the shown input folder",
         [
             ("bg", f"BG / background removal       -> put files in {bg_input}"),
             ("sheet", f"Sheets / character split     -> put files in {sheet_input}"),
             ("items", f"Items / equipment extraction -> put files in {items_input}"),
+            ("clothing", f"Person clothing separation   -> put files in {clothing_input}"),
             ("back", "Back"),
         ],
     )
@@ -347,6 +378,8 @@ def _quick_menu(config: dict) -> None:
         _quick_sheet(config)
     elif choice == "items":
         _quick_items(config)
+    elif choice == "clothing":
+        _quick_clothing(config)
 
 
 @app.callback()
