@@ -10,6 +10,8 @@ TASK_DIRS = {
     "bg": "bg",
     "sheets": "sheets",
     "items": "items",
+    "clothing": "clothing",
+    "garment": "clothing",
 }
 
 
@@ -48,7 +50,7 @@ def task_dir_name(task_group: str) -> str:
 
 def ensure_workspace_root(workspace_root: str | Path) -> Path:
     root = Path(workspace_root)
-    for task in ["bg", "sheets", "items"]:
+    for task in ["bg", "sheets", "items", "clothing"]:
         for rel in ["input", "jobs", "failed"]:
             (root / task / rel).mkdir(parents=True, exist_ok=True)
     (root / "reports").mkdir(parents=True, exist_ok=True)
@@ -83,9 +85,6 @@ def create_job_paths(
     base_name = sanitize_job_name(job_name) if job_name else derive_job_name_from_input(input_path or "job")
     job_root = _unique_job_dir(jobs_root, base_name)
     input_root = job_root / "input"
-
-    # The job folder itself is the output location. Do not create a nested
-    # output/ directory; only input/ is kept as the source archive.
     output_root = job_root
     reports_root = job_root
 
@@ -130,6 +129,6 @@ def resolve_output_for_task(
 
     if task_group == "bg":
         return job_paths.output_root / f"{stem}.png", job_paths
-    if task_group in {"sheets", "items"}:
+    if task_group in {"sheets", "items", "clothing", "garment"}:
         return job_paths.output_root, job_paths
     return job_paths.output_root / stem, job_paths
