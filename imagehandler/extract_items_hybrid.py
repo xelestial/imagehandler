@@ -157,6 +157,12 @@ def extract_items(
             "trial_thin_items": int(trial["shape"]["thin_items"]),
             "baseline_tiny_items": int(baseline["shape"]["tiny_items"]),
             "trial_tiny_items": int(trial["shape"]["tiny_items"]),
+            "baseline_low_fill_items": int(baseline["shape"]["low_fill_items"]),
+            "trial_low_fill_items": int(trial["shape"]["low_fill_items"]),
+            "baseline_long_low_fill_items": int(baseline["shape"]["long_low_fill_items"]),
+            "trial_long_low_fill_items": int(trial["shape"]["long_low_fill_items"]),
+            "baseline_garbage_like_items": int(baseline["shape"]["garbage_like_items"]),
+            "trial_garbage_like_items": int(trial["shape"]["garbage_like_items"]),
         }
     )
 
@@ -200,7 +206,7 @@ def extract_items(
         ok=len(warnings) == 0,
         operation="extract-items",
         source=str(source),
-        mode="hybrid-alpha-support-rgb-core-final-refine-sam-mask-proposals-parent-decompose-rollback",
+        mode="hybrid-alpha-support-rgb-core-final-refine-sam-mask-proposals-parent-decompose-rollback-strict",
         warnings=warnings,
         metrics={
             "items": len(boxes),
@@ -230,6 +236,12 @@ def extract_items(
             "sam_parent_trial_thin_items": parent_decomposition_info["trial_thin_items"],
             "sam_parent_baseline_tiny_items": parent_decomposition_info["baseline_tiny_items"],
             "sam_parent_trial_tiny_items": parent_decomposition_info["trial_tiny_items"],
+            "sam_parent_baseline_low_fill_items": parent_decomposition_info["baseline_low_fill_items"],
+            "sam_parent_trial_low_fill_items": parent_decomposition_info["trial_low_fill_items"],
+            "sam_parent_baseline_long_low_fill_items": parent_decomposition_info["baseline_long_low_fill_items"],
+            "sam_parent_trial_long_low_fill_items": parent_decomposition_info["trial_long_low_fill_items"],
+            "sam_parent_baseline_garbage_like_items": parent_decomposition_info["baseline_garbage_like_items"],
+            "sam_parent_trial_garbage_like_items": parent_decomposition_info["trial_garbage_like_items"],
             "recursive_splits": split_count,
             "coverage_recovered_components": recovery_count,
             "pruned_parent_boxes": pruned_parent_boxes,
@@ -312,8 +324,10 @@ def _accept_parent_decomposition_trial(
 
     baseline_boxes = baseline["boxes"]
     trial_boxes = trial["boxes"]
+    item_growth = len(trial_boxes) - len(baseline_boxes)
     baseline_coverage = float(baseline["coverage"]["coverage_ratio"])
     trial_coverage = float(trial["coverage"]["coverage_ratio"])
+    coverage_drop = baseline_coverage - trial_coverage
     baseline_dup = float(baseline["coverage"]["duplication_ratio"])
     trial_dup = float(trial["coverage"]["duplication_ratio"])
     baseline_shape = baseline["shape"]
@@ -321,6 +335,10 @@ def _accept_parent_decomposition_trial(
 
     if trial_coverage < max(0.80, baseline_coverage - 0.025):
         return False, "coverage_drop"
+    if coverage_drop > 0.015 and item_growth >= 3:
+        return False, "coverage_drop_with_item_growth"
+    if coverage_drop > 0.010 and int(trial_shape["low_fill_items"]) > int(baseline_shape["low_fill_items"]):
+        return False, "coverage_drop_with_low_fill"
     if trial_dup > max(1.25, baseline_dup + 0.15):
         return False, "duplication_increase"
     if len(trial_boxes) > len(baseline_boxes) + 6:
@@ -329,6 +347,10 @@ def _accept_parent_decomposition_trial(
         return False, "thin_item_excess"
     if int(trial_shape["tiny_items"]) > int(baseline_shape["tiny_items"]) + 2:
         return False, "tiny_item_excess"
+    if int(trial_shape["low_fill_items"]) > int(baseline_shape["low_fill_items"]) + 1:
+        return False, "low_fill_item_excess"
+    if int(trial_shape["long_low_fill_items"]) > int(baseline_shape["long_low_fill_items"]):
+        return False, "long_low_fill_item_excess"
     if int(trial_shape["garbage_like_items"]) > int(baseline_shape["garbage_like_items"]):
         return False, "garbage_like_item_excess"
     if int(trial["dropped_empty_items"]) > int(baseline["dropped_empty_items"]):
@@ -337,12 +359,16 @@ def _accept_parent_decomposition_trial(
     # Require a real benefit, not just churn. Otherwise keep the safer baseline.
     if len(trial_boxes) <= len(baseline_boxes) and trial_coverage <= baseline_coverage + 0.005:
         return False, "no_clear_gain"
+    if item_growth >= 3 and coverage_drop > 0.005 and int(parent_info.get("residual_boxes_added", 0)) > 0:
+        return False, "residual_churn_without_gain"
     return True, "accepted"
 
 
 def _item_shape_quality_stats(boxes: list[BBox], item_masks: list[np.ndarray], min_area: int) -> dict[str, int]:
     thin_items = 0
     tiny_items = 0
+    low_fill_items = 0
+    long_low_fill_items = 0
     garbage_like_items = 0
     tiny_threshold = max(24, int(min_area * 0.65))
     for box, item_mask in zip(boxes, item_masks, strict=True):
@@ -354,13 +380,21 @@ def _item_shape_quality_stats(boxes: list[BBox], item_masks: list[np.ndarray], m
         thin_ratio = short_side / long_side
         fill_ratio = pixels / max(1, box.area)
         is_thin = thin_ratio < 0.16 or (short_side <= 8 and long_side >= 36)
+        is_low_fill = fill_ratio < 0.09 or (fill_ratio < 0.13 and pixels < min_area * 2.0)
+        is_long_low_fill = (long_side >= 48 and fill_ratio < 0.10) or (long_side / short_side >= 5.0 and fill_ratio < 0.18)
         if is_thin:
             thin_items += 1
-        if (is_thin and pixels < min_area * 1.8) or fill_ratio < 0.055:
+        if is_low_fill:
+            low_fill_items += 1
+        if is_long_low_fill:
+            long_low_fill_items += 1
+        if (is_thin and pixels < min_area * 1.8) or is_long_low_fill or fill_ratio < 0.055:
             garbage_like_items += 1
     return {
         "thin_items": thin_items,
         "tiny_items": tiny_items,
+        "low_fill_items": low_fill_items,
+        "long_low_fill_items": long_low_fill_items,
         "garbage_like_items": garbage_like_items,
     }
 
