@@ -47,6 +47,7 @@ mkdir -p \
   "$WORKSPACE_DIR/bg/input" "$WORKSPACE_DIR/bg/jobs" "$WORKSPACE_DIR/bg/failed" \
   "$WORKSPACE_DIR/sheets/input" "$WORKSPACE_DIR/sheets/jobs" "$WORKSPACE_DIR/sheets/failed" \
   "$WORKSPACE_DIR/items/input" "$WORKSPACE_DIR/items/jobs" "$WORKSPACE_DIR/items/failed" \
+  "$WORKSPACE_DIR/clothing/input" "$WORKSPACE_DIR/clothing/jobs" "$WORKSPACE_DIR/clothing/failed" \
   "$WORKSPACE_DIR/reports"
 
 if [[ "${EUID:-$(id -u)}" -eq 0 ]]; then
@@ -81,6 +82,9 @@ Optimized workspace folders are ready:
 
   Items input:
     $WORKSPACE_DIR/items/input
+
+  Clothing input:
+    $WORKSPACE_DIR/clothing/input
 
   Success flow:
     $WORKSPACE_DIR/<task>/input/source.png
@@ -129,6 +133,7 @@ Examples:
   ./run.sh bg batch-remove workspace/bg/input --workspace ./workspace --recursive
   ./run.sh sheet batch-split workspace/sheets/input --workspace ./workspace --views 4 --recursive
   ./run.sh items batch-extract workspace/items/input --workspace ./workspace --recursive
+  ./run.sh garment extract workspace/clothing/input/source.png --workspace ./workspace
 USAGE
     ;;
   *)
