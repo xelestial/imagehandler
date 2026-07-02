@@ -6,7 +6,7 @@ from typing import Optional
 import typer
 
 from imagehandler.batch import BatchResult, iter_image_files, move_input_to_failed, move_input_to_job_input, relative_output_dir
-from imagehandler.extract_items_alpha import extract_items
+from imagehandler.extract_items_hybrid import extract_items
 from imagehandler.workspace import resolve_output_for_task
 
 from .common import print_batch_result, print_job_paths, print_operation_report
