@@ -107,7 +107,7 @@ def extract_items(
     split_count += final_splits
     boxes = sort_boxes_reading_order(_dedupe_boxes(boxes))
 
-    item_masks = _assign_instance_masks(support_mask, boxes, width, height)
+    item_masks, assignment_info = _assign_instance_masks(support_mask, boxes, width, height)
     mask_stats = _instance_mask_stats(support_mask, boxes, item_masks)
 
     coverage = _coverage_metrics(support_mask, boxes)
@@ -142,7 +142,7 @@ def extract_items(
         ok=len(warnings) == 0,
         operation="extract-items",
         source=str(source),
-        mode="hybrid-alpha-support-rgb-core-final-refine-instance-mask-crop",
+        mode="hybrid-alpha-support-rgb-core-final-refine-component-owner-mask-crop",
         warnings=warnings,
         metrics={
             "items": len(boxes),
@@ -155,6 +155,10 @@ def extract_items(
             "recursive_splits": split_count,
             "coverage_recovered_components": recovery_count,
             "pruned_parent_boxes": pruned_parent_boxes,
+            "instance_mask_components": assignment_info["components"],
+            "instance_mask_large_components": assignment_info["large_components"],
+            "instance_mask_single_owner_components": assignment_info["single_owner_components"],
+            "instance_mask_multi_owner_components": assignment_info["multi_owner_components"],
             "instance_mask_assigned_pixels": mask_stats["assigned_pixels"],
             "instance_mask_unassigned_pixels": mask_stats["unassigned_pixels"],
             "instance_mask_empty_items": mask_stats["empty_items"],
@@ -282,33 +286,128 @@ def _make_hybrid_seed_mask(core_mask: np.ndarray, support_mask: np.ndarray, imag
     return (seed.astype(bool) & support_mask.astype(bool))
 
 
-def _assign_instance_masks(mask: np.ndarray, boxes: list[BBox], image_width: int, image_height: int) -> list[np.ndarray]:
-    """Assign foreground pixels to item boxes, favoring small/specific boxes.
+def _assign_instance_masks(mask: np.ndarray, boxes: list[BBox], image_width: int, image_height: int) -> tuple[list[np.ndarray], dict[str, int]]:
+    """Assign foreground by connected component ownership.
 
-    Each foreground pixel is assigned at most once. Smaller boxes claim pixels first;
-    large parent boxes then receive only remaining foreground pixels. This preserves
-    major parent crops while reducing contamination from nearby child items.
+    The previous implementation let small boxes claim pixels first. That removed
+    crop contamination in some cases, but it also let child boxes steal pixels
+    from the main parent component. This version assigns ownership per connected
+    component first, then partitions only large components across major boxes.
     """
     labels = np.full((image_height, image_width), -1, dtype=np.int32)
-    order = sorted(range(len(boxes)), key=lambda idx: (boxes[idx].area, boxes[idx].top, boxes[idx].left))
-    for idx in order:
-        box = boxes[idx]
-        local_fg = mask[box.top : box.bottom, box.left : box.right].astype(bool)
-        if not local_fg.any():
+    support = mask.astype(np.uint8)
+    num_labels, component_labels, stats, centroids = cv2.connectedComponentsWithStats(support, connectivity=8)
+    support_pixels = max(1, int(mask.sum()))
+    large_components = 0
+    single_owner_components = 0
+    multi_owner_components = 0
+
+    for component_id in range(1, num_labels):
+        area = int(stats[component_id, cv2.CC_STAT_AREA])
+        if area <= 0:
             continue
-        local_labels = labels[box.top : box.bottom, box.left : box.right]
-        claim = local_fg & (local_labels < 0)
-        local_labels[claim] = idx
+        left = int(stats[component_id, cv2.CC_STAT_LEFT])
+        top = int(stats[component_id, cv2.CC_STAT_TOP])
+        width = int(stats[component_id, cv2.CC_STAT_WIDTH])
+        height = int(stats[component_id, cv2.CC_STAT_HEIGHT])
+        component_box = BBox(left, top, left + width, top + height)
+        component_mask = component_labels == component_id
+        candidates = _component_box_candidates(component_mask, component_box, area, centroids[component_id], boxes)
+        if not candidates:
+            continue
+
+        is_large = area / support_pixels >= 0.045 or component_box.area / max(1, image_width * image_height) >= 0.04
+        if is_large:
+            large_components += 1
+
+        if not is_large or len(candidates) == 1:
+            owner = candidates[0][0]
+            labels[component_mask] = owner
+            single_owner_components += 1
+            continue
+
+        multi_owner_components += 1
+        component_pixels_left = component_mask.copy()
+        for owner, _score, overlap_count in candidates:
+            if overlap_count < max(24, int(area * 0.025)):
+                continue
+            box = boxes[owner]
+            claim = np.zeros_like(component_mask, dtype=bool)
+            claim[box.top : box.bottom, box.left : box.right] = component_pixels_left[box.top : box.bottom, box.left : box.right]
+            if int(claim.sum()) > 0:
+                labels[claim] = owner
+                component_pixels_left[claim] = False
+        if component_pixels_left.any():
+            labels[component_pixels_left] = candidates[0][0]
 
     item_masks: list[np.ndarray] = []
     for idx, box in enumerate(boxes):
         item_mask = labels == idx
         if int(item_mask.sum()) == 0:
-            fallback = np.zeros_like(mask, dtype=bool)
-            fallback[box.top : box.bottom, box.left : box.right] = mask[box.top : box.bottom, box.left : box.right]
-            item_mask = fallback
-        item_masks.append(item_mask)
-    return item_masks
+            item_mask = _fallback_instance_mask(mask, labels, box, idx, boxes)
+        item_masks.append(item_mask.astype(bool))
+
+    info = {
+        "components": max(0, num_labels - 1),
+        "large_components": large_components,
+        "single_owner_components": single_owner_components,
+        "multi_owner_components": multi_owner_components,
+    }
+    return item_masks, info
+
+
+def _component_box_candidates(
+    component_mask: np.ndarray,
+    component_box: BBox,
+    component_area: int,
+    centroid: np.ndarray,
+    boxes: list[BBox],
+) -> list[tuple[int, float, int]]:
+    candidates: list[tuple[int, float, int]] = []
+    cx = float(centroid[0])
+    cy = float(centroid[1])
+    for idx, box in enumerate(boxes):
+        left = max(component_box.left, box.left)
+        top = max(component_box.top, box.top)
+        right = min(component_box.right, box.right)
+        bottom = min(component_box.bottom, box.bottom)
+        if right <= left or bottom <= top:
+            continue
+        overlap = int(component_mask[top:bottom, left:right].sum())
+        if overlap <= 0:
+            continue
+        overlap_ratio = overlap / max(1, component_area)
+        box_fill = overlap / max(1, box.area)
+        bbox_iou = _iou(component_box, box)
+        center_bonus = 0.35 if (box.left <= cx <= box.right and box.top <= cy <= box.bottom) else 0.0
+        size_ratio = min(box.area, component_box.area) / max(1, max(box.area, component_box.area))
+        score = (overlap_ratio * 4.0) + (bbox_iou * 2.0) + (box_fill * 0.75) + center_bonus + (size_ratio * 0.5)
+        candidates.append((idx, float(score), overlap))
+    candidates.sort(key=lambda item: item[1], reverse=True)
+    return candidates
+
+
+def _fallback_instance_mask(mask: np.ndarray, labels: np.ndarray, box: BBox, box_index: int, boxes: list[BBox]) -> np.ndarray:
+    local_fg = mask[box.top : box.bottom, box.left : box.right].astype(bool)
+    if not local_fg.any():
+        return np.zeros_like(mask, dtype=bool)
+    local_labels = labels[box.top : box.bottom, box.left : box.right]
+    available = local_fg & (local_labels < 0)
+    if int(available.sum()) == 0:
+        # Do not blindly steal a larger parent's pixels. Only recover local pixels
+        # when this box is not mostly inside a much larger box.
+        mostly_inside_large_parent = any(
+            other_idx != box_index
+            and other.area > box.area * 2.2
+            and _contained_ratio(box, other) > 0.65
+            for other_idx, other in enumerate(boxes)
+        )
+        if mostly_inside_large_parent:
+            return np.zeros_like(mask, dtype=bool)
+        available = local_fg
+    out = np.zeros_like(mask, dtype=bool)
+    out[box.top : box.bottom, box.left : box.right] = available
+    return out
 
 
 def _crop_with_instance_mask(
