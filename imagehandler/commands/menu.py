@@ -19,6 +19,7 @@ app = typer.Typer(help="Interactive menu launcher.", invoke_without_command=True
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".tif", ".tiff"}
 BISENET_MODEL_REL = Path("models") / "bisenet_face_parsing.onnx"
 HUMAN_PARSING_MODEL_REL = Path("models") / "human_parsing.onnx"
+SAM_MODEL_REL = Path("models") / "sam_vit_b_01ec64.pth"
 
 DEFAULT_CONFIG = {
     "profile": "balanced",
@@ -56,6 +57,7 @@ DEFAULT_CONFIG = {
         "retry_on_fail": True,
         "min_count": 1,
         "continue_on_error": True,
+        "sam": {"enabled": False, "checkpoint": str(SAM_MODEL_REL)},
     },
     "clothing": {
         "recursive": True,
@@ -71,19 +73,19 @@ PROFILES = {
     "fast": {
         "bg": {"retry_on_fail": False, "head": {"mode": "off", "debug": False}},
         "sheet": {"debug": False, "retry_on_fail": False},
-        "items": {"debug": False, "retry_on_fail": False},
+        "items": {"debug": False, "retry_on_fail": False, "sam": {"enabled": False}},
         "clothing": {"debug": False},
     },
     "balanced": {
         "bg": {"retry_on_fail": True, "head": {"mode": "mediapipe", "debug": False}},
         "sheet": {"debug": True, "retry_on_fail": True},
-        "items": {"debug": True, "retry_on_fail": True},
+        "items": {"debug": True, "retry_on_fail": True, "sam": {"enabled": False}},
         "clothing": {"debug": True},
     },
     "high_quality": {
         "bg": {"retry_on_fail": True, "alpha_matting": True, "head": {"mode": "bisenet", "debug": True}},
         "sheet": {"debug": True, "retry_on_fail": True},
-        "items": {"debug": True, "retry_on_fail": True},
+        "items": {"debug": True, "retry_on_fail": True, "sam": {"enabled": True}},
         "clothing": {"debug": True},
     },
 }
@@ -103,6 +105,22 @@ def _bisenet_model_path() -> Path:
 
 def _human_parsing_model_path() -> Path:
     return _project_root() / HUMAN_PARSING_MODEL_REL
+
+
+def _sam_config(config: dict) -> dict:
+    items = config.setdefault("items", {})
+    sam = items.setdefault("sam", {"enabled": False, "checkpoint": str(SAM_MODEL_REL)})
+    sam.setdefault("enabled", False)
+    sam.setdefault("checkpoint", str(SAM_MODEL_REL))
+    return sam
+
+
+def _sam_model_path(config: dict | None = None) -> Path:
+    checkpoint = str(_sam_config(config).get("checkpoint", str(SAM_MODEL_REL))) if config is not None else str(SAM_MODEL_REL)
+    path = Path(checkpoint)
+    if path.is_absolute():
+        return path
+    return _project_root() / path
 
 
 def _ensure_workspace() -> Path:
@@ -142,6 +160,7 @@ def _normalize_config(config: dict) -> dict:
     for section in ["sheet", "items", "clothing"]:
         for key, value in DEFAULT_CONFIG[section].items():
             config[section].setdefault(key, value)
+    _sam_config(config)
     return config
 
 
@@ -236,14 +255,30 @@ def _head_runtime_options(config: dict) -> tuple[bool, Path | None, bool]:
     return True, None, debug
 
 
+def _items_sam_runtime_options(config: dict) -> tuple[bool, Path | None]:
+    sam = _sam_config(config)
+    enabled = bool(sam.get("enabled", False))
+    model_path = _sam_model_path(config)
+    if not enabled:
+        return False, None
+    if not model_path.is_file():
+        typer.echo(f"[WARN] SAM model is not installed: {model_path}")
+        typer.echo("       SAM proposals are disabled for this run.")
+        return False, None
+    return True, model_path
+
+
 def _show_config(config: dict) -> None:
     head = _head_config(config)
+    sam = _sam_config(config)
+    sam_path = _sam_model_path(config)
     typer.echo("\nCurrent config")
     typer.echo(f"  Profile: {config.get('profile')}")
     typer.echo(f"  BG retry    : {config['bg']['retry_on_fail']}")
     typer.echo(f"  BG head     : mode={head.get('mode')} debug={head.get('debug')}")
     typer.echo(f"  BiSeNet ONNX: {_bisenet_model_path()} ({'installed' if _bisenet_model_path().is_file() else 'missing'})")
     typer.echo(f"  Human parser: {_human_parsing_model_path()} ({'installed' if _human_parsing_model_path().is_file() else 'missing'})")
+    typer.echo(f"  SAM items   : enabled={sam.get('enabled')} path={sam_path} ({'installed' if sam_path.is_file() else 'missing'})")
     typer.echo(f"  Sheet retry : {config['sheet']['retry_on_fail']} / views={config['sheet']['views']} / recursive={config['sheet']['recursive']}")
     typer.echo(f"  Items retry : {config['items']['retry_on_fail']} / recursive={config['items']['recursive']}")
     typer.echo(f"  Clothing    : debug={config['clothing']['debug']} / recursive={config['clothing']['recursive']}")
@@ -267,16 +302,36 @@ def _head_settings_menu(config: dict) -> dict:
             return _normalize_config(config)
 
 
+def _items_settings_menu(config: dict) -> dict:
+    sam = _sam_config(config)
+    while True:
+        sam_path = _sam_model_path(config)
+        typer.echo("\nItems settings")
+        typer.echo(f"  SAM proposals: {sam.get('enabled', False)}")
+        typer.echo(f"  SAM checkpoint: {sam_path} ({'installed' if sam_path.is_file() else 'missing'})")
+        choice = _choose("Items settings", [("sam", "Toggle SAM proposals"), ("path", "Reset SAM checkpoint path to default"), ("back", "Back")])
+        if choice == "sam":
+            sam["enabled"] = not bool(sam.get("enabled", False))
+            _save_config(config)
+        elif choice == "path":
+            sam["checkpoint"] = str(SAM_MODEL_REL)
+            _save_config(config)
+        else:
+            return _normalize_config(config)
+
+
 def _config_menu(config: dict) -> dict:
     while True:
         _show_config(config)
-        choice = _choose("Config", [("profile", "Choose profile"), ("head", "Head refinement settings"), ("reset", "Reset defaults"), ("back", "Back")])
+        choice = _choose("Config", [("profile", "Choose profile"), ("head", "Head refinement settings"), ("items", "Items settings"), ("reset", "Reset defaults"), ("back", "Back")])
         if choice == "profile":
             profile = _choose("Profile", [("fast", "Fast"), ("balanced", "Balanced"), ("high_quality", "High quality")])
             _apply_profile(config, profile)
             _save_config(config)
         elif choice == "head":
             config = _head_settings_menu(config)
+        elif choice == "items":
+            config = _items_settings_menu(config)
         elif choice == "reset":
             config = json.loads(json.dumps(DEFAULT_CONFIG))
             _save_config(config)
@@ -320,7 +375,8 @@ def _quick_items(config: dict) -> None:
     if not pending:
         return
     opts = config["items"]
-    batch_extract_cmd(input_dir, None, _workspace_root(), opts.get("recursive", True), None, opts["padding"], opts["min_area"], opts["merge_distance"], opts["square_canvas"], opts.get("normalize_size"), opts["transparent_bg"], opts["threshold"], opts["debug"], opts["retry_on_fail"], opts["min_count"], opts["continue_on_error"])
+    sam_enabled, sam_checkpoint = _items_sam_runtime_options(config)
+    batch_extract_cmd(input_dir, None, _workspace_root(), opts.get("recursive", True), None, opts["padding"], opts["min_area"], opts["merge_distance"], opts["square_canvas"], opts.get("normalize_size"), opts["transparent_bg"], opts["threshold"], opts["debug"], opts["retry_on_fail"], opts["min_count"], opts["continue_on_error"], sam_enabled, sam_checkpoint)
 
 
 def _quick_clothing(config: dict) -> None:
