@@ -16,6 +16,10 @@ env/
 .imagehandler-env
 .setup_smoke/
 
+# Local model artifacts / checkpoints
+models/*
+!models/.gitkeep
+
 # ImageHandler runtime workspace
 workspace/
 
