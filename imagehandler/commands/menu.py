@@ -202,7 +202,7 @@ def _show_hint() -> None:
     typer.echo("\nSuccess flow:")
     typer.echo(f"  {root}/<task>/input/source.png")
     typer.echo(f"  -> {root}/<task>/jobs/<job>/input/source.png")
-    typer.echo(f"  -> {root}/<task>/jobs/<job>/output/")
+    typer.echo(f"  -> {root}/<task>/jobs/<job>/")
     typer.echo("\nFailure flow:")
     typer.echo(f"  {root}/<task>/failed/source.png")
 
@@ -294,7 +294,7 @@ def _show_task_help(task: str, title: str) -> tuple[Path, list[Path]]:
     typer.echo(f"\n{title}")
     typer.echo(f"  Put source files here : {input_dir}")
     typer.echo(f"  Success source archive: {jobs_dir}/<job>/input")
-    typer.echo(f"  Results are under     : {jobs_dir}/<job>/output")
+    typer.echo(f"  Results are under     : {jobs_dir}/<job>")
     typer.echo(f"  Failed files go to    : {failed_dir}")
     typer.echo(f"  Pending image count   : {len(pending)}")
     if not pending:
