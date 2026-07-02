@@ -100,6 +100,14 @@ def extract_items(
     boxes, extra_splits = _split_stacked_and_row_boxes(support_mask, boxes, width, height, min_area)
     split_count += extra_splits
     boxes, recovery_count = _recover_missing_foreground(support_mask, boxes, width, height, min_area)
+    boxes, final_splits, pruned_parent_boxes = _final_refine_after_recovery(
+        support_mask,
+        boxes,
+        width,
+        height,
+        min_area,
+    )
+    split_count += final_splits
     boxes = sort_boxes_reading_order(_dedupe_boxes(boxes))
 
     coverage = _coverage_metrics(support_mask, boxes)
@@ -134,7 +142,7 @@ def extract_items(
         ok=len(warnings) == 0,
         operation="extract-items",
         source=str(source),
-        mode="hybrid-alpha-support-rgb-core",
+        mode="hybrid-alpha-support-rgb-core-final-refine",
         warnings=warnings,
         metrics={
             "items": len(boxes),
@@ -146,6 +154,7 @@ def extract_items(
             "sam_status": sam_info.get("status"),
             "recursive_splits": split_count,
             "coverage_recovered_components": recovery_count,
+            "pruned_parent_boxes": pruned_parent_boxes,
             "image_width": width,
             "image_height": height,
             "min_area": min_area,
@@ -267,6 +276,120 @@ def _make_hybrid_seed_mask(core_mask: np.ndarray, support_mask: np.ndarray, imag
     seed = cv2.erode(seed, kernel, iterations=1)
     seed = cv2.dilate(seed, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=1)
     return (seed.astype(bool) & support_mask.astype(bool))
+
+
+def _final_refine_after_recovery(
+    mask: np.ndarray,
+    boxes: list[BBox],
+    image_width: int,
+    image_height: int,
+    min_area: int,
+) -> tuple[list[BBox], int, int]:
+    boxes, component_splits = _split_broad_boxes_by_components(mask, boxes, image_width, image_height, min_area)
+    boxes, stacked_splits = _split_stacked_and_row_boxes(mask, boxes, image_width, image_height, min_area)
+    boxes, pruned = _prune_parent_child_boxes(mask, boxes)
+    boxes, second_component_splits = _split_broad_boxes_by_components(mask, boxes, image_width, image_height, min_area)
+    return _dedupe_boxes(boxes), component_splits + stacked_splits + second_component_splits, pruned
+
+
+def _split_broad_boxes_by_components(
+    mask: np.ndarray,
+    boxes: list[BBox],
+    image_width: int,
+    image_height: int,
+    min_area: int,
+) -> tuple[list[BBox], int]:
+    result: list[BBox] = []
+    splits = 0
+    for box in boxes:
+        if not _should_component_split(box, image_width, image_height):
+            result.append(box)
+            continue
+        local = mask[box.top : box.bottom, box.left : box.right].astype(bool)
+        if not local.any():
+            continue
+        local_min_area = max(min_area, int(local.sum() * 0.035), 32)
+        components = components_bboxes(local, min_area=local_min_area, min_size=4)
+        child_boxes: list[BBox] = []
+        for child, _area in components:
+            mapped = BBox(
+                box.left + child.left,
+                box.top + child.top,
+                box.left + child.right,
+                box.top + child.bottom,
+            )
+            if mapped.area >= min_area:
+                child_boxes.append(mapped)
+        child_boxes = _dedupe_boxes(child_boxes)
+        if len(child_boxes) >= 2 and _children_cover_parent(mask, box, child_boxes) >= 0.55:
+            result.extend(child_boxes)
+            splits += len(child_boxes) - 1
+        else:
+            result.append(box)
+    return _dedupe_boxes(result), splits
+
+
+def _should_component_split(box: BBox, image_width: int, image_height: int) -> bool:
+    image_area = max(1, image_width * image_height)
+    return (
+        box.area / image_area > 0.055
+        or (box.width > image_width * 0.28 and box.height > image_height * 0.05)
+        or (box.height > image_height * 0.12 and box.width > image_width * 0.05)
+        or box.width > box.height * 2.0
+        or box.height > box.width * 1.35
+    )
+
+
+def _children_cover_parent(mask: np.ndarray, parent: BBox, children: list[BBox]) -> float:
+    parent_mask = mask[parent.top : parent.bottom, parent.left : parent.right].astype(bool)
+    parent_pixels = int(parent_mask.sum())
+    if parent_pixels <= 0:
+        return 0.0
+    covered = np.zeros_like(parent_mask, dtype=bool)
+    for child in children:
+        left = max(parent.left, child.left) - parent.left
+        top = max(parent.top, child.top) - parent.top
+        right = min(parent.right, child.right) - parent.left
+        bottom = min(parent.bottom, child.bottom) - parent.top
+        if right > left and bottom > top:
+            covered[top:bottom, left:right] |= parent_mask[top:bottom, left:right]
+    return float(int(covered.sum()) / parent_pixels)
+
+
+def _prune_parent_child_boxes(mask: np.ndarray, boxes: list[BBox]) -> tuple[list[BBox], int]:
+    boxes = sort_boxes_reading_order(_dedupe_boxes(boxes))
+    remove: set[int] = set()
+    for i, parent in enumerate(boxes):
+        children: list[BBox] = []
+        for j, child in enumerate(boxes):
+            if i == j or j in remove:
+                continue
+            if child.area >= parent.area * 0.78:
+                continue
+            if _contained_ratio(child, parent) > 0.74 or _iou(child, parent) > 0.45:
+                children.append(child)
+        if len(children) >= 2 and _children_cover_parent(mask, parent, children) > 0.78:
+            remove.add(i)
+    return [box for idx, box in enumerate(boxes) if idx not in remove], len(remove)
+
+
+def _contained_ratio(a: BBox, b: BBox) -> float:
+    left = max(a.left, b.left)
+    top = max(a.top, b.top)
+    right = min(a.right, b.right)
+    bottom = min(a.bottom, b.bottom)
+    inter = max(0, right - left) * max(0, bottom - top)
+    return float(inter / max(1, a.area))
+
+
+def _iou(a: BBox, b: BBox) -> float:
+    left = max(a.left, b.left)
+    top = max(a.top, b.top)
+    right = min(a.right, b.right)
+    bottom = min(a.bottom, b.bottom)
+    inter = max(0, right - left) * max(0, bottom - top)
+    union = max(1, a.area + b.area - inter)
+    return float(inter / union)
 
 
 def _split_stacked_and_row_boxes(mask: np.ndarray, boxes: list[BBox], image_width: int, image_height: int, min_area: int) -> tuple[list[BBox], int]:
