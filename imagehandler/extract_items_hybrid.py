@@ -15,7 +15,6 @@ from .extract_items_plus import (
     _independent_small_original_boxes,
     _merge_seed_boxes_safely,
     _recover_missing_foreground,
-    _sam_proposal_boxes,
     _save_coverage_debug,
     _seed_boxes,
     _split_or_reject_broad_boxes,
@@ -33,6 +32,9 @@ from .mask_ops import (
     to_square_canvas,
 )
 from .reports import BBox, OperationReport
+
+
+SAM_MODEL_REL = Path("models") / "sam_vit_b_01ec64.pth"
 
 
 def extract_items(
@@ -72,7 +74,13 @@ def extract_items(
     )
 
     watershed_boxes = _watershed_boxes(core_mask, min_area=min_area, image_width=width, image_height=height)
-    sam_boxes, sam_info = _sam_proposal_boxes(image, support_mask, min_area=min_area, image_width=width, image_height=height)
+    sam_boxes, sam_masks, sam_info = _sam_proposal_masks(
+        image,
+        support_mask,
+        min_area=min_area,
+        image_width=width,
+        image_height=height,
+    )
 
     boxes = _dedupe_boxes([*seed_grown_boxes, *watershed_boxes, *sam_boxes])
     boxes = _merge_seed_boxes_safely(
@@ -107,7 +115,14 @@ def extract_items(
     split_count += final_splits
     boxes = sort_boxes_reading_order(_dedupe_boxes(boxes))
 
-    item_masks, assignment_info = _assign_instance_masks(support_mask, boxes, width, height)
+    item_masks, assignment_info = _assign_instance_masks(
+        support_mask,
+        boxes,
+        width,
+        height,
+        sam_masks=sam_masks,
+    )
+    boxes, item_masks, dropped_empty_items = _drop_empty_item_masks(boxes, item_masks, min_area)
     mask_stats = _instance_mask_stats(support_mask, boxes, item_masks)
 
     coverage = _coverage_metrics(support_mask, boxes)
@@ -116,6 +131,8 @@ def extract_items(
         warnings.append("No foreground items were detected.")
     if len(boxes) > 200:
         warnings.append("Very many components were detected; increase min_area or merge_distance.")
+    if dropped_empty_items > 0:
+        warnings.append(f"Dropped {dropped_empty_items} empty or near-empty item mask(s).")
     if coverage["coverage_ratio"] < 0.80:
         warnings.append("Low item coverage; many source foreground pixels were not covered by extracted crops.")
     if coverage["duplication_ratio"] > 1.60:
@@ -142,7 +159,7 @@ def extract_items(
         ok=len(warnings) == 0,
         operation="extract-items",
         source=str(source),
-        mode="hybrid-alpha-support-rgb-core-final-refine-component-owner-mask-crop",
+        mode="hybrid-alpha-support-rgb-core-final-refine-sam-mask-proposals",
         warnings=warnings,
         metrics={
             "items": len(boxes),
@@ -151,14 +168,18 @@ def extract_items(
             "seed_grown_components": len(seed_grown_boxes),
             "watershed_components": len(watershed_boxes),
             "sam_components": len(sam_boxes),
+            "sam_masks": len(sam_masks),
+            "sam_raw_masks": sam_info.get("raw_masks", 0),
             "sam_status": sam_info.get("status"),
             "recursive_splits": split_count,
             "coverage_recovered_components": recovery_count,
             "pruned_parent_boxes": pruned_parent_boxes,
+            "dropped_empty_items": dropped_empty_items,
             "instance_mask_components": assignment_info["components"],
             "instance_mask_large_components": assignment_info["large_components"],
             "instance_mask_single_owner_components": assignment_info["single_owner_components"],
             "instance_mask_multi_owner_components": assignment_info["multi_owner_components"],
+            "instance_mask_sam_prior_items": assignment_info["sam_prior_items"],
             "instance_mask_assigned_pixels": mask_stats["assigned_pixels"],
             "instance_mask_unassigned_pixels": mask_stats["unassigned_pixels"],
             "instance_mask_empty_items": mask_stats["empty_items"],
@@ -186,6 +207,7 @@ def extract_items(
         save_boxes_overlay(image, boxes, out_dir / "debug_boxes.png")
         _save_coverage_debug(support_mask, boxes, out_dir / "debug_coverage_mask.png")
         _save_instance_debug(item_masks, out_dir / "debug_instance_assignment.png")
+        _save_sam_prior_debug(sam_masks, support_mask, out_dir / "debug_sam_mask_proposals.png")
 
     return report
 
@@ -286,14 +308,75 @@ def _make_hybrid_seed_mask(core_mask: np.ndarray, support_mask: np.ndarray, imag
     return (seed.astype(bool) & support_mask.astype(bool))
 
 
-def _assign_instance_masks(mask: np.ndarray, boxes: list[BBox], image_width: int, image_height: int) -> tuple[list[np.ndarray], dict[str, int]]:
-    """Assign foreground by connected component ownership.
+def _sam_proposal_masks(
+    image: Image.Image,
+    mask: np.ndarray,
+    min_area: int,
+    image_width: int,
+    image_height: int,
+) -> tuple[list[BBox], list[np.ndarray], dict[str, object]]:
+    model_path = Path.cwd() / SAM_MODEL_REL
+    if not model_path.is_file():
+        return [], [], {"status": "missing_model"}
+    try:
+        from segment_anything import SamAutomaticMaskGenerator, sam_model_registry  # type: ignore
+    except Exception:
+        return [], [], {"status": "missing_dependency"}
+    try:
+        import torch  # type: ignore
 
-    The previous implementation let small boxes claim pixels first. That removed
-    crop contamination in some cases, but it also let child boxes steal pixels
-    from the main parent component. This version assigns ownership per connected
-    component first, then partitions only large components across major boxes.
-    """
+        sam = sam_model_registry["vit_b"](checkpoint=str(model_path))
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        sam.to(device=device)
+        generator = SamAutomaticMaskGenerator(
+            sam,
+            points_per_side=24,
+            pred_iou_thresh=0.82,
+            stability_score_thresh=0.86,
+            min_mask_region_area=max(min_area, 64),
+        )
+        proposals = generator.generate(np.asarray(image.convert("RGB")))
+    except Exception as exc:
+        return [], [], {"status": "runtime_error", "error": str(exc)}
+
+    source_fg = mask.astype(bool)
+    boxes: list[BBox] = []
+    masks: list[np.ndarray] = []
+    image_area = max(1, image_width * image_height)
+    for item in proposals:
+        seg = np.asarray(item.get("segmentation"), dtype=bool)
+        if seg.shape != source_fg.shape:
+            continue
+        fg_overlap = seg & source_fg
+        area = int(fg_overlap.sum())
+        if area < min_area:
+            continue
+        ys, xs = np.where(fg_overlap)
+        box = BBox(int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+        if _is_sam_box_too_broad(box, image_width, image_height, image_area):
+            continue
+        boxes.append(box)
+        masks.append(fg_overlap.astype(bool))
+    return _dedupe_boxes(boxes), masks, {"status": "ok", "raw_masks": len(proposals), "kept_masks": len(masks)}
+
+
+def _is_sam_box_too_broad(box: BBox, image_width: int, image_height: int, image_area: int) -> bool:
+    if box.area / max(1, image_area) > 0.72:
+        return True
+    if box.width > image_width * 0.88 and box.height > image_height * 0.42:
+        return True
+    if box.height > image_height * 0.88 and box.width > image_width * 0.42:
+        return True
+    return False
+
+
+def _assign_instance_masks(
+    mask: np.ndarray,
+    boxes: list[BBox],
+    image_width: int,
+    image_height: int,
+    sam_masks: list[np.ndarray] | None = None,
+) -> tuple[list[np.ndarray], dict[str, int]]:
     labels = np.full((image_height, image_width), -1, dtype=np.int32)
     support = mask.astype(np.uint8)
     num_labels, component_labels, stats, centroids = cv2.connectedComponentsWithStats(support, connectivity=8)
@@ -301,6 +384,7 @@ def _assign_instance_masks(mask: np.ndarray, boxes: list[BBox], image_width: int
     large_components = 0
     single_owner_components = 0
     multi_owner_components = 0
+    sam_priors = _match_sam_masks_to_boxes(mask, boxes, sam_masks or [])
 
     for component_id in range(1, num_labels):
         area = int(stats[component_id, cv2.CC_STAT_AREA])
@@ -312,7 +396,7 @@ def _assign_instance_masks(mask: np.ndarray, boxes: list[BBox], image_width: int
         height = int(stats[component_id, cv2.CC_STAT_HEIGHT])
         component_box = BBox(left, top, left + width, top + height)
         component_mask = component_labels == component_id
-        candidates = _component_box_candidates(component_mask, component_box, area, centroids[component_id], boxes)
+        candidates = _component_box_candidates(component_mask, component_box, area, centroids[component_id], boxes, sam_priors)
         if not candidates:
             continue
 
@@ -332,8 +416,15 @@ def _assign_instance_masks(mask: np.ndarray, boxes: list[BBox], image_width: int
             if overlap_count < max(24, int(area * 0.025)):
                 continue
             box = boxes[owner]
-            claim = np.zeros_like(component_mask, dtype=bool)
-            claim[box.top : box.bottom, box.left : box.right] = component_pixels_left[box.top : box.bottom, box.left : box.right]
+            prior = sam_priors[owner]
+            if prior is not None:
+                claim = component_pixels_left & prior
+                if int(claim.sum()) < max(24, int(overlap_count * 0.12)):
+                    claim = np.zeros_like(component_mask, dtype=bool)
+                    claim[box.top : box.bottom, box.left : box.right] = component_pixels_left[box.top : box.bottom, box.left : box.right]
+            else:
+                claim = np.zeros_like(component_mask, dtype=bool)
+                claim[box.top : box.bottom, box.left : box.right] = component_pixels_left[box.top : box.bottom, box.left : box.right]
             if int(claim.sum()) > 0:
                 labels[claim] = owner
                 component_pixels_left[claim] = False
@@ -343,6 +434,11 @@ def _assign_instance_masks(mask: np.ndarray, boxes: list[BBox], image_width: int
     item_masks: list[np.ndarray] = []
     for idx, box in enumerate(boxes):
         item_mask = labels == idx
+        prior = sam_priors[idx]
+        if prior is not None:
+            refined = item_mask & _dilate_bool(prior, 3)
+            if int(refined.sum()) >= max(32, int(item_mask.sum() * 0.35)):
+                item_mask = refined
         if int(item_mask.sum()) == 0:
             item_mask = _fallback_instance_mask(mask, labels, box, idx, boxes)
         item_masks.append(item_mask.astype(bool))
@@ -352,8 +448,48 @@ def _assign_instance_masks(mask: np.ndarray, boxes: list[BBox], image_width: int
         "large_components": large_components,
         "single_owner_components": single_owner_components,
         "multi_owner_components": multi_owner_components,
+        "sam_prior_items": sum(1 for prior in sam_priors if prior is not None),
     }
     return item_masks, info
+
+
+def _match_sam_masks_to_boxes(mask: np.ndarray, boxes: list[BBox], sam_masks: list[np.ndarray]) -> list[np.ndarray | None]:
+    priors: list[np.ndarray | None] = [None] * len(boxes)
+    if not sam_masks or not boxes:
+        return priors
+    support = mask.astype(bool)
+    for idx, box in enumerate(boxes):
+        box_mask = np.zeros_like(support, dtype=bool)
+        box_mask[box.top : box.bottom, box.left : box.right] = support[box.top : box.bottom, box.left : box.right]
+        box_pixels = int(box_mask.sum())
+        if box_pixels <= 0:
+            continue
+        best: tuple[float, np.ndarray] | None = None
+        for proposal in sam_masks:
+            sam = proposal.astype(bool) & support
+            sam_pixels = int(sam.sum())
+            if sam_pixels <= 0:
+                continue
+            overlap = int((sam & box_mask).sum())
+            if overlap <= 0:
+                continue
+            overlap_to_box = overlap / max(1, box_pixels)
+            overlap_to_sam = overlap / max(1, sam_pixels)
+            if overlap_to_box < 0.32 and overlap_to_sam < 0.58:
+                continue
+            if sam_pixels > box_pixels * 2.8 and overlap_to_box < 0.78:
+                continue
+            ys, xs = np.where(sam)
+            sam_box = BBox(int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
+            bbox_iou = _iou(box, sam_box)
+            contained = max(_contained_ratio(sam_box, box), _contained_ratio(box, sam_box))
+            size_ratio = min(sam_pixels, box_pixels) / max(1, max(sam_pixels, box_pixels))
+            score = overlap_to_box * 2.4 + overlap_to_sam * 2.0 + bbox_iou * 1.5 + contained + size_ratio * 0.6
+            if best is None or score > best[0]:
+                best = (score, sam)
+        if best is not None and best[0] >= 2.25:
+            priors[idx] = best[1]
+    return priors
 
 
 def _component_box_candidates(
@@ -362,6 +498,7 @@ def _component_box_candidates(
     component_area: int,
     centroid: np.ndarray,
     boxes: list[BBox],
+    sam_priors: list[np.ndarray | None] | None = None,
 ) -> list[tuple[int, float, int]]:
     candidates: list[tuple[int, float, int]] = []
     cx = float(centroid[0])
@@ -381,7 +518,13 @@ def _component_box_candidates(
         bbox_iou = _iou(component_box, box)
         center_bonus = 0.35 if (box.left <= cx <= box.right and box.top <= cy <= box.bottom) else 0.0
         size_ratio = min(box.area, component_box.area) / max(1, max(box.area, component_box.area))
-        score = (overlap_ratio * 4.0) + (bbox_iou * 2.0) + (box_fill * 0.75) + center_bonus + (size_ratio * 0.5)
+        sam_bonus = 0.0
+        if sam_priors is not None and idx < len(sam_priors) and sam_priors[idx] is not None:
+            prior = sam_priors[idx]
+            prior_overlap = int((component_mask & prior).sum())
+            if prior_overlap > 0:
+                sam_bonus = (prior_overlap / max(1, component_area)) * 2.7 + (prior_overlap / max(1, int(prior.sum()))) * 1.1
+        score = (overlap_ratio * 4.0) + (bbox_iou * 2.0) + (box_fill * 0.75) + center_bonus + (size_ratio * 0.5) + sam_bonus
         candidates.append((idx, float(score), overlap))
     candidates.sort(key=lambda item: item[1], reverse=True)
     return candidates
@@ -394,8 +537,6 @@ def _fallback_instance_mask(mask: np.ndarray, labels: np.ndarray, box: BBox, box
     local_labels = labels[box.top : box.bottom, box.left : box.right]
     available = local_fg & (local_labels < 0)
     if int(available.sum()) == 0:
-        # Do not blindly steal a larger parent's pixels. Only recover local pixels
-        # when this box is not mostly inside a much larger box.
         mostly_inside_large_parent = any(
             other_idx != box_index
             and other.area > box.area * 2.2
@@ -408,6 +549,20 @@ def _fallback_instance_mask(mask: np.ndarray, labels: np.ndarray, box: BBox, box
     out = np.zeros_like(mask, dtype=bool)
     out[box.top : box.bottom, box.left : box.right] = available
     return out
+
+
+def _drop_empty_item_masks(boxes: list[BBox], item_masks: list[np.ndarray], min_area: int) -> tuple[list[BBox], list[np.ndarray], int]:
+    kept_boxes: list[BBox] = []
+    kept_masks: list[np.ndarray] = []
+    dropped = 0
+    threshold = max(16, int(min_area * 0.35))
+    for box, item_mask in zip(boxes, item_masks, strict=True):
+        if int(item_mask.sum()) < threshold:
+            dropped += 1
+            continue
+        kept_boxes.append(box)
+        kept_masks.append(item_mask)
+    return kept_boxes, kept_masks, dropped
 
 
 def _crop_with_instance_mask(
@@ -461,6 +616,23 @@ def _save_instance_debug(item_masks: list[np.ndarray], path: Path) -> None:
         value = 32 + ((idx * 37) % 223)
         preview[item_mask.astype(bool)] = value
     Image.fromarray(preview, mode="L").save(path)
+
+
+def _save_sam_prior_debug(sam_masks: list[np.ndarray], support_mask: np.ndarray, path: Path) -> None:
+    if not sam_masks:
+        return
+    preview = np.zeros(support_mask.shape, dtype=np.uint8)
+    for idx, sam_mask in enumerate(sam_masks, start=1):
+        value = 24 + ((idx * 31) % 231)
+        preview[(sam_mask.astype(bool) & support_mask.astype(bool))] = value
+    Image.fromarray(preview, mode="L").save(path)
+
+
+def _dilate_bool(mask: np.ndarray, size: int) -> np.ndarray:
+    if size <= 1:
+        return mask.astype(bool)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+    return cv2.dilate(mask.astype(np.uint8), kernel, iterations=1).astype(bool)
 
 
 def _final_refine_after_recovery(
