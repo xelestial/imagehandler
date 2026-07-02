@@ -38,6 +38,9 @@ head = [
   "mediapipe>=0.10.14",
   "onnxruntime>=1.17"
 ]
+sam = [
+  "segment-anything>=1.0"
+]
 dev = [
   "pytest>=8.0",
   "ruff>=0.5"
