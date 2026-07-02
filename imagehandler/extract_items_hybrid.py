@@ -83,7 +83,16 @@ def extract_items(
         image_height=height,
     )
 
-    boxes = _dedupe_boxes([*seed_grown_boxes, *watershed_boxes, *sam_boxes])
+    base_boxes = _dedupe_boxes([*seed_grown_boxes, *watershed_boxes])
+    sam_extra_boxes = _filter_sam_extra_boxes(
+        mask=support_mask,
+        base_boxes=base_boxes,
+        sam_boxes=sam_boxes,
+        min_area=min_area,
+        image_width=width,
+        image_height=height,
+    )
+    boxes = _dedupe_boxes([*base_boxes, *sam_extra_boxes])
     boxes = _merge_seed_boxes_safely(
         boxes,
         image_width=width,
@@ -170,8 +179,10 @@ def extract_items(
     item_masks = selected["item_masks"]
     assignment_info = selected["assignment_info"]
     dropped_empty_items = int(selected["dropped_empty_items"])
+    dropped_artifact_items = int(selected["dropped_artifact_items"])
     mask_stats = selected["mask_stats"]
     coverage = selected["coverage"]
+    final_shape = selected["shape"]
 
     warnings: list[str] = []
     if not boxes:
@@ -180,6 +191,10 @@ def extract_items(
         warnings.append("Very many components were detected; increase min_area or merge_distance.")
     if dropped_empty_items > 0:
         warnings.append(f"Dropped {dropped_empty_items} empty or near-empty item mask(s).")
+    if dropped_artifact_items > 0:
+        warnings.append(f"Dropped {dropped_artifact_items} thin/low-fill artifact item(s).")
+    if final_shape["garbage_like_items"] > 0:
+        warnings.append("Potential artifact-like item crops remain; review debug output.")
     if coverage["coverage_ratio"] < 0.80:
         warnings.append("Low item coverage; many source foreground pixels were not covered by extracted crops.")
     if coverage["duplication_ratio"] > 1.60:
@@ -206,7 +221,7 @@ def extract_items(
         ok=len(warnings) == 0,
         operation="extract-items",
         source=str(source),
-        mode="hybrid-alpha-support-rgb-core-final-refine-sam-mask-proposals-parent-decompose-rollback-strict",
+        mode="hybrid-alpha-support-rgb-core-sam-prior-artifact-filter",
         warnings=warnings,
         metrics={
             "items": len(boxes),
@@ -215,6 +230,7 @@ def extract_items(
             "seed_grown_components": len(seed_grown_boxes),
             "watershed_components": len(watershed_boxes),
             "sam_components": len(sam_boxes),
+            "sam_extra_boxes_used": len(sam_extra_boxes),
             "sam_masks": len(sam_masks),
             "sam_raw_masks": sam_info.get("raw_masks", 0),
             "sam_status": sam_info.get("status"),
@@ -246,6 +262,12 @@ def extract_items(
             "coverage_recovered_components": recovery_count,
             "pruned_parent_boxes": pruned_parent_boxes,
             "dropped_empty_items": dropped_empty_items,
+            "dropped_artifact_items": dropped_artifact_items,
+            "final_thin_items": int(final_shape["thin_items"]),
+            "final_tiny_items": int(final_shape["tiny_items"]),
+            "final_low_fill_items": int(final_shape["low_fill_items"]),
+            "final_long_low_fill_items": int(final_shape["long_low_fill_items"]),
+            "final_garbage_like_items": int(final_shape["garbage_like_items"]),
             "instance_mask_components": assignment_info["components"],
             "instance_mask_large_components": assignment_info["large_components"],
             "instance_mask_single_owner_components": assignment_info["single_owner_components"],
@@ -283,6 +305,51 @@ def extract_items(
     return report
 
 
+def _filter_sam_extra_boxes(
+    mask: np.ndarray,
+    base_boxes: list[BBox],
+    sam_boxes: list[BBox],
+    min_area: int,
+    image_width: int,
+    image_height: int,
+) -> list[BBox]:
+    if not sam_boxes:
+        return []
+    support = mask.astype(bool)
+    base_covered = np.zeros_like(support, dtype=bool)
+    for base in base_boxes:
+        base_covered[base.top : base.bottom, base.left : base.right] |= support[base.top : base.bottom, base.left : base.right]
+
+    extras: list[BBox] = []
+    image_area = max(1, image_width * image_height)
+    for box in sam_boxes:
+        if box.area < max(min_area * 2, 96):
+            continue
+        if box.area / image_area > 0.18:
+            continue
+        local = support[box.top : box.bottom, box.left : box.right]
+        pixels = int(local.sum())
+        if pixels < max(min_area, 64):
+            continue
+        fill_ratio = pixels / max(1, box.area)
+        if fill_ratio < 0.12:
+            continue
+        short_side = max(1, min(box.width, box.height))
+        long_side = max(1, max(box.width, box.height))
+        if short_side / long_side < 0.18:
+            continue
+        if any(_iou(box, base) > 0.36 or _contained_ratio(box, base) > 0.62 or _contained_ratio(base, box) > 0.84 for base in base_boxes):
+            continue
+        box_mask = np.zeros_like(support, dtype=bool)
+        box_mask[box.top : box.bottom, box.left : box.right] = support[box.top : box.bottom, box.left : box.right]
+        already_covered = int((box_mask & base_covered).sum())
+        uncovered_ratio = 1.0 - (already_covered / max(1, pixels))
+        if uncovered_ratio < 0.42:
+            continue
+        extras.append(box)
+    return sort_boxes_reading_order(_dedupe_boxes(extras))
+
+
 def _evaluate_item_candidate(
     mask: np.ndarray,
     boxes: list[BBox],
@@ -300,6 +367,7 @@ def _evaluate_item_candidate(
         sam_masks=sam_masks,
     )
     candidate_boxes, item_masks, dropped_empty_items = _drop_empty_item_masks(candidate_boxes, item_masks, min_area)
+    candidate_boxes, item_masks, dropped_artifact_items = _drop_artifact_item_masks(candidate_boxes, item_masks, min_area)
     mask_stats = _instance_mask_stats(mask, candidate_boxes, item_masks)
     coverage = _coverage_metrics(mask, candidate_boxes)
     shape = _item_shape_quality_stats(candidate_boxes, item_masks, min_area)
@@ -308,6 +376,7 @@ def _evaluate_item_candidate(
         "item_masks": item_masks,
         "assignment_info": assignment_info,
         "dropped_empty_items": dropped_empty_items,
+        "dropped_artifact_items": dropped_artifact_items,
         "mask_stats": mask_stats,
         "coverage": coverage,
         "shape": shape,
@@ -355,8 +424,9 @@ def _accept_parent_decomposition_trial(
         return False, "garbage_like_item_excess"
     if int(trial["dropped_empty_items"]) > int(baseline["dropped_empty_items"]):
         return False, "empty_item_increase"
+    if int(trial["dropped_artifact_items"]) > int(baseline["dropped_artifact_items"]):
+        return False, "artifact_drop_increase"
 
-    # Require a real benefit, not just churn. Otherwise keep the safer baseline.
     if len(trial_boxes) <= len(baseline_boxes) and trial_coverage <= baseline_coverage + 0.005:
         return False, "no_clear_gain"
     if item_growth >= 3 and coverage_drop > 0.005 and int(parent_info.get("residual_boxes_added", 0)) > 0:
@@ -952,6 +1022,40 @@ def _drop_empty_item_masks(boxes: list[BBox], item_masks: list[np.ndarray], min_
         kept_boxes.append(box)
         kept_masks.append(item_mask)
     return kept_boxes, kept_masks, dropped
+
+
+def _drop_artifact_item_masks(boxes: list[BBox], item_masks: list[np.ndarray], min_area: int) -> tuple[list[BBox], list[np.ndarray], int]:
+    kept_boxes: list[BBox] = []
+    kept_masks: list[np.ndarray] = []
+    dropped = 0
+    for box, item_mask in zip(boxes, item_masks, strict=True):
+        if _is_artifact_item(box, item_mask, min_area):
+            dropped += 1
+            continue
+        kept_boxes.append(box)
+        kept_masks.append(item_mask)
+    return kept_boxes, kept_masks, dropped
+
+
+def _is_artifact_item(box: BBox, item_mask: np.ndarray, min_area: int) -> bool:
+    pixels = int(item_mask.sum())
+    if pixels <= 0:
+        return True
+    short_side = max(1, min(box.width, box.height))
+    long_side = max(1, max(box.width, box.height))
+    fill_ratio = pixels / max(1, box.area)
+    thin_ratio = short_side / long_side
+    if short_side <= 4 and long_side >= 32:
+        return True
+    if thin_ratio < 0.08 and pixels < min_area * 4:
+        return True
+    if fill_ratio < 0.045 and pixels < min_area * 5:
+        return True
+    if fill_ratio < 0.075 and long_side / short_side >= 4.5 and pixels < min_area * 5:
+        return True
+    if pixels < max(32, int(min_area * 0.55)) and fill_ratio < 0.16:
+        return True
+    return False
 
 
 def _crop_with_instance_mask(
