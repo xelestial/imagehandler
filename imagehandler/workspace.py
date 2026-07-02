@@ -83,11 +83,14 @@ def create_job_paths(
     base_name = sanitize_job_name(job_name) if job_name else derive_job_name_from_input(input_path or "job")
     job_root = _unique_job_dir(jobs_root, base_name)
     input_root = job_root / "input"
-    output_root = job_root / "output"
-    reports_root = job_root / "reports"
 
-    for folder in [input_root, output_root]:
-        folder.mkdir(parents=True, exist_ok=True)
+    # The job folder itself is the output location. Do not create a nested
+    # output/ directory; only input/ is kept as the source archive.
+    output_root = job_root
+    reports_root = job_root
+
+    input_root.mkdir(parents=True, exist_ok=True)
+    output_root.mkdir(parents=True, exist_ok=True)
 
     return JobPaths(
         workspace_root=root,
