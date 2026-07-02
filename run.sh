@@ -85,7 +85,7 @@ Optimized workspace folders are ready:
   Success flow:
     $WORKSPACE_DIR/<task>/input/source.png
     -> $WORKSPACE_DIR/<task>/jobs/<job_name>/input/source.png
-    -> $WORKSPACE_DIR/<task>/jobs/<job_name>/output/
+    -> $WORKSPACE_DIR/<task>/jobs/<job_name>/
 
   Failure flow:
     $WORKSPACE_DIR/<task>/failed/source.png
