@@ -11,6 +11,7 @@ MODE="cpu"
 WITH_HEAD=1
 WITH_TRANSPARENT=0
 WITH_MATTING=0
+WITH_SAM=0
 WITH_DEV=0
 USE_VENV=1
 SKIP_SMOKE=0
@@ -50,8 +51,9 @@ Options:
   --no-head          Skip head dependency install; head refinement falls back to safe mode.
   --transparent      Also install transparent-background backend.
   --matting          Also install pymatting backend.
+  --sam              Install optional SAM proposal support and download ViT-B checkpoint.
   --dev              Also install pytest and ruff.
-  --all              Install CPU stack plus head, transparent, matting, and dev tools.
+  --all              Install CPU stack plus head, transparent, matting, and dev tools. Does not install SAM.
   --no-venv          Install into the current Python environment.
   --skip-smoke       Skip smoke tests after installation.
   --workspace DIR    Create workspace folders under DIR. Default: ./workspace
@@ -69,6 +71,10 @@ Important:
 Recommended:
   ./setup.sh
   ./run.sh
+
+SAM proposal support:
+  ./setup.sh --sam
+  The checkpoint is stored at models/sam_vit_b_01ec64.pth.
 USAGE
 }
 
@@ -85,6 +91,7 @@ while [[ $# -gt 0 ]]; do
     --no-head) WITH_HEAD=0 ;;
     --transparent) WITH_TRANSPARENT=1 ;;
     --matting) WITH_MATTING=1 ;;
+    --sam) WITH_SAM=1 ;;
     --dev) WITH_DEV=1 ;;
     --all) WITH_HEAD=1; WITH_TRANSPARENT=1; WITH_MATTING=1; WITH_DEV=1; MODE="cpu" ;;
     --no-venv) USE_VENV=0 ;;
@@ -275,6 +282,13 @@ install_optional_packages() {
   fi
 }
 
+run_optional() {
+  log "Running optional: $*"
+  if ! "$@"; then
+    warn "Optional command failed: $*. Continuing without it."
+  fi
+}
+
 log "Upgrading packaging tools"
 "$PY" -m pip install --upgrade pip setuptools wheel
 
@@ -299,6 +313,12 @@ if [[ "$WITH_MATTING" -eq 1 ]]; then
   install_packages "pymatting>=1.1"
 fi
 
+if [[ "$WITH_SAM" -eq 1 ]]; then
+  install_optional_packages "torch>=2.1" "torchvision>=0.16"
+  install_optional_packages "git+https://github.com/facebookresearch/segment-anything.git"
+  run_optional "$PY" tools/download_sam_model.py --output models/sam_vit_b_01ec64.pth
+fi
+
 if [[ "$WITH_DEV" -eq 1 ]]; then
   install_packages "pytest>=8.0" "ruff>=0.5"
 fi
@@ -317,7 +337,7 @@ for module in required:
         missing.append(module)
 if missing:
     raise SystemExit(1)
-for module in ["mediapipe", "onnxruntime"]:
+for module in ["mediapipe", "onnxruntime", "torch", "segment_anything"]:
     try:
         importlib.import_module(module)
         print(f"OK optional: {module}")
@@ -398,7 +418,7 @@ Put source files here:
 Success flow:
   <task>/input/source.png
   -> <task>/jobs/<job_name>/input/source.png
-  -> <task>/jobs/<job_name>/output/
+  -> <task>/jobs/<job_name>/
 
 Failure flow:
   <task>/failed/source.png
@@ -410,3 +430,10 @@ cat <<EOF
 Recommended workflow:
   ./run.sh
 EOF
+if [[ "$WITH_SAM" -eq 1 ]]; then
+  cat <<EOF
+
+SAM proposal support:
+  Check model: ls -lh models/sam_vit_b_01ec64.pth
+EOF
+fi
