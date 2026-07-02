@@ -72,4 +72,4 @@ def print_job_paths(job_paths) -> None:
         return
     console.print("[cyan]job folder:[/cyan] " + str(job_paths.job_root))
     console.print("[cyan]source archive:[/cyan] " + str(job_paths.input_root))
-    console.print("[cyan]outputs:[/cyan] " + str(job_paths.output_root))
+    console.print("[cyan]results:[/cyan] " + str(job_paths.output_root))
