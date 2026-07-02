@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from typing import Any
 
 import cv2
 import numpy as np
@@ -113,27 +114,59 @@ def extract_items(
         min_area,
     )
     split_count += final_splits
-    boxes, parent_decomposition_info = _decompose_broad_parents_with_sam(
+
+    baseline = _evaluate_item_candidate(
         mask=support_mask,
         boxes=boxes,
+        image_width=width,
+        image_height=height,
+        sam_masks=sam_masks,
+        min_area=min_area,
+    )
+    trial_raw_boxes, parent_decomposition_info = _decompose_broad_parents_with_sam(
+        mask=support_mask,
+        boxes=baseline["boxes"],
         sam_masks=sam_masks,
         image_width=width,
         image_height=height,
         min_area=min_area,
     )
-    boxes = sort_boxes_reading_order(_dedupe_boxes(boxes))
-
-    item_masks, assignment_info = _assign_instance_masks(
-        support_mask,
-        boxes,
-        width,
-        height,
+    trial = _evaluate_item_candidate(
+        mask=support_mask,
+        boxes=trial_raw_boxes,
+        image_width=width,
+        image_height=height,
         sam_masks=sam_masks,
+        min_area=min_area,
     )
-    boxes, item_masks, dropped_empty_items = _drop_empty_item_masks(boxes, item_masks, min_area)
-    mask_stats = _instance_mask_stats(support_mask, boxes, item_masks)
+    trial_accepted, trial_reject_reason = _accept_parent_decomposition_trial(baseline, trial, parent_decomposition_info)
+    selected = trial if trial_accepted else baseline
 
-    coverage = _coverage_metrics(support_mask, boxes)
+    parent_decomposition_info.update(
+        {
+            "trial_accepted": int(trial_accepted),
+            "trial_rejected": int(not trial_accepted and parent_decomposition_info["parents_decomposed"] > 0),
+            "trial_reject_reason": trial_reject_reason,
+            "baseline_items": len(baseline["boxes"]),
+            "trial_items": len(trial["boxes"]),
+            "baseline_coverage_ratio": float(baseline["coverage"]["coverage_ratio"]),
+            "trial_coverage_ratio": float(trial["coverage"]["coverage_ratio"]),
+            "baseline_duplication_ratio": float(baseline["coverage"]["duplication_ratio"]),
+            "trial_duplication_ratio": float(trial["coverage"]["duplication_ratio"]),
+            "baseline_thin_items": int(baseline["shape"]["thin_items"]),
+            "trial_thin_items": int(trial["shape"]["thin_items"]),
+            "baseline_tiny_items": int(baseline["shape"]["tiny_items"]),
+            "trial_tiny_items": int(trial["shape"]["tiny_items"]),
+        }
+    )
+
+    boxes = selected["boxes"]
+    item_masks = selected["item_masks"]
+    assignment_info = selected["assignment_info"]
+    dropped_empty_items = int(selected["dropped_empty_items"])
+    mask_stats = selected["mask_stats"]
+    coverage = selected["coverage"]
+
     warnings: list[str] = []
     if not boxes:
         warnings.append("No foreground items were detected.")
@@ -167,7 +200,7 @@ def extract_items(
         ok=len(warnings) == 0,
         operation="extract-items",
         source=str(source),
-        mode="hybrid-alpha-support-rgb-core-final-refine-sam-mask-proposals-parent-decompose",
+        mode="hybrid-alpha-support-rgb-core-final-refine-sam-mask-proposals-parent-decompose-rollback",
         warnings=warnings,
         metrics={
             "items": len(boxes),
@@ -184,6 +217,19 @@ def extract_items(
             "sam_child_boxes_added": parent_decomposition_info["child_boxes_added"],
             "sam_parent_residual_boxes": parent_decomposition_info["residual_boxes_added"],
             "sam_parent_boxes_removed": parent_decomposition_info["parent_boxes_removed"],
+            "sam_parent_trial_accepted": parent_decomposition_info["trial_accepted"],
+            "sam_parent_trial_rejected": parent_decomposition_info["trial_rejected"],
+            "sam_parent_trial_reject_reason": parent_decomposition_info["trial_reject_reason"],
+            "sam_parent_baseline_items": parent_decomposition_info["baseline_items"],
+            "sam_parent_trial_items": parent_decomposition_info["trial_items"],
+            "sam_parent_baseline_coverage_ratio": parent_decomposition_info["baseline_coverage_ratio"],
+            "sam_parent_trial_coverage_ratio": parent_decomposition_info["trial_coverage_ratio"],
+            "sam_parent_baseline_duplication_ratio": parent_decomposition_info["baseline_duplication_ratio"],
+            "sam_parent_trial_duplication_ratio": parent_decomposition_info["trial_duplication_ratio"],
+            "sam_parent_baseline_thin_items": parent_decomposition_info["baseline_thin_items"],
+            "sam_parent_trial_thin_items": parent_decomposition_info["trial_thin_items"],
+            "sam_parent_baseline_tiny_items": parent_decomposition_info["baseline_tiny_items"],
+            "sam_parent_trial_tiny_items": parent_decomposition_info["trial_tiny_items"],
             "recursive_splits": split_count,
             "coverage_recovered_components": recovery_count,
             "pruned_parent_boxes": pruned_parent_boxes,
@@ -223,6 +269,100 @@ def extract_items(
         _save_sam_prior_debug(sam_masks, support_mask, out_dir / "debug_sam_mask_proposals.png")
 
     return report
+
+
+def _evaluate_item_candidate(
+    mask: np.ndarray,
+    boxes: list[BBox],
+    image_width: int,
+    image_height: int,
+    sam_masks: list[np.ndarray],
+    min_area: int,
+) -> dict[str, Any]:
+    candidate_boxes = sort_boxes_reading_order(_dedupe_boxes(boxes))
+    item_masks, assignment_info = _assign_instance_masks(
+        mask,
+        candidate_boxes,
+        image_width,
+        image_height,
+        sam_masks=sam_masks,
+    )
+    candidate_boxes, item_masks, dropped_empty_items = _drop_empty_item_masks(candidate_boxes, item_masks, min_area)
+    mask_stats = _instance_mask_stats(mask, candidate_boxes, item_masks)
+    coverage = _coverage_metrics(mask, candidate_boxes)
+    shape = _item_shape_quality_stats(candidate_boxes, item_masks, min_area)
+    return {
+        "boxes": candidate_boxes,
+        "item_masks": item_masks,
+        "assignment_info": assignment_info,
+        "dropped_empty_items": dropped_empty_items,
+        "mask_stats": mask_stats,
+        "coverage": coverage,
+        "shape": shape,
+    }
+
+
+def _accept_parent_decomposition_trial(
+    baseline: dict[str, Any],
+    trial: dict[str, Any],
+    parent_info: dict[str, Any],
+) -> tuple[bool, str]:
+    if int(parent_info.get("parents_decomposed", 0)) <= 0:
+        return False, "no_decomposition"
+
+    baseline_boxes = baseline["boxes"]
+    trial_boxes = trial["boxes"]
+    baseline_coverage = float(baseline["coverage"]["coverage_ratio"])
+    trial_coverage = float(trial["coverage"]["coverage_ratio"])
+    baseline_dup = float(baseline["coverage"]["duplication_ratio"])
+    trial_dup = float(trial["coverage"]["duplication_ratio"])
+    baseline_shape = baseline["shape"]
+    trial_shape = trial["shape"]
+
+    if trial_coverage < max(0.80, baseline_coverage - 0.025):
+        return False, "coverage_drop"
+    if trial_dup > max(1.25, baseline_dup + 0.15):
+        return False, "duplication_increase"
+    if len(trial_boxes) > len(baseline_boxes) + 6:
+        return False, "item_count_excess"
+    if int(trial_shape["thin_items"]) > int(baseline_shape["thin_items"]) + 1:
+        return False, "thin_item_excess"
+    if int(trial_shape["tiny_items"]) > int(baseline_shape["tiny_items"]) + 2:
+        return False, "tiny_item_excess"
+    if int(trial_shape["garbage_like_items"]) > int(baseline_shape["garbage_like_items"]):
+        return False, "garbage_like_item_excess"
+    if int(trial["dropped_empty_items"]) > int(baseline["dropped_empty_items"]):
+        return False, "empty_item_increase"
+
+    # Require a real benefit, not just churn. Otherwise keep the safer baseline.
+    if len(trial_boxes) <= len(baseline_boxes) and trial_coverage <= baseline_coverage + 0.005:
+        return False, "no_clear_gain"
+    return True, "accepted"
+
+
+def _item_shape_quality_stats(boxes: list[BBox], item_masks: list[np.ndarray], min_area: int) -> dict[str, int]:
+    thin_items = 0
+    tiny_items = 0
+    garbage_like_items = 0
+    tiny_threshold = max(24, int(min_area * 0.65))
+    for box, item_mask in zip(boxes, item_masks, strict=True):
+        pixels = int(item_mask.sum())
+        if pixels < tiny_threshold:
+            tiny_items += 1
+        short_side = max(1, min(box.width, box.height))
+        long_side = max(1, max(box.width, box.height))
+        thin_ratio = short_side / long_side
+        fill_ratio = pixels / max(1, box.area)
+        is_thin = thin_ratio < 0.16 or (short_side <= 8 and long_side >= 36)
+        if is_thin:
+            thin_items += 1
+        if (is_thin and pixels < min_area * 1.8) or fill_ratio < 0.055:
+            garbage_like_items += 1
+    return {
+        "thin_items": thin_items,
+        "tiny_items": tiny_items,
+        "garbage_like_items": garbage_like_items,
+    }
 
 
 def _build_support_and_core_masks(source: Path, image: Image.Image, out_dir: Path, threshold: float) -> tuple[np.ndarray, np.ndarray, dict[str, object]]:
@@ -390,8 +530,8 @@ def _decompose_broad_parents_with_sam(
     image_width: int,
     image_height: int,
     min_area: int,
-) -> tuple[list[BBox], dict[str, int]]:
-    info = {
+) -> tuple[list[BBox], dict[str, Any]]:
+    info: dict[str, Any] = {
         "parent_candidates": 0,
         "parents_decomposed": 0,
         "child_boxes_added": 0,
