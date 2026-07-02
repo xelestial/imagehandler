@@ -28,6 +28,10 @@ def extract_cmd(
     transparent_bg: bool = typer.Option(False),
     threshold: float = typer.Option(28.0),
     debug: bool = typer.Option(False),
+    retry_on_fail: bool = typer.Option(False),
+    accept_verdict: str = typer.Option("PASS"),
+    min_score: float = typer.Option(85.0),
+    min_count: int = typer.Option(1),
 ):
     out_dir, job_paths = resolve_output_for_task("items", input_path, output_dir, workspace, job)
     report = extract_items(
@@ -61,6 +65,8 @@ def batch_extract_cmd(
     transparent_bg: bool = typer.Option(False),
     threshold: float = typer.Option(28.0),
     debug: bool = typer.Option(False),
+    retry_on_fail: bool = typer.Option(False),
+    min_count: int = typer.Option(1),
     continue_on_error: bool = typer.Option(True),
 ):
     files = iter_image_files(input_path, recursive=recursive, pattern=pattern)
