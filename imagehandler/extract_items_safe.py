@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -11,6 +12,14 @@ from .fallback import remove_background_with_fallback
 from .io import ensure_output_dir, load_image
 from .mask_ops import clean_mask, components_bboxes, foreground_mask_from_background, normalize_size, sort_boxes_reading_order, to_square_canvas
 from .reports import BBox, OperationReport
+
+
+@dataclass
+class _Component:
+    label: int
+    box: BBox
+    area: int
+    mask: np.ndarray
 
 
 def extract_items(
@@ -32,6 +41,7 @@ def extract_items(
 
     support_mask, preprocess_info = _build_safe_support_mask(source, image, out_dir, threshold, debug)
     safe_mask = _clean_safe_mask(support_mask, width, height)
+    safe_mask, island_info = _attach_or_drop_small_islands(safe_mask, width, height, min_area)
     boxes = _top_level_boxes(safe_mask, width, height, min_area)
 
     warnings: list[str] = []
@@ -62,7 +72,7 @@ def extract_items(
         ok=len(warnings) == 0,
         operation="extract-items",
         source=str(source),
-        mode="safe-top-level-components",
+        mode="safe-top-level-components-small-island-attach-drop",
         warnings=warnings,
         metrics={
             "items": len(boxes),
@@ -71,7 +81,8 @@ def extract_items(
             "image_height": height,
             "min_area": min_area,
             "merge_distance_ignored": merge_distance,
-            "safe_policy": "top-level-object-islands-no-internal-splitting",
+            "safe_policy": "top-level-object-islands-no-internal-splitting-small-island-attach-drop",
+            **island_info,
             **preprocess_info,
             **coverage,
         },
@@ -162,6 +173,117 @@ def _clean_safe_mask(mask: np.ndarray, image_width: int, image_height: int) -> n
     return cleaned.astype(bool)
 
 
+def _attach_or_drop_small_islands(mask: np.ndarray, image_width: int, image_height: int, min_area: int) -> tuple[np.ndarray, dict[str, int]]:
+    components = _components_from_mask(mask)
+    total_fg = max(1, int(mask.sum()))
+    small_area_threshold = max(min_area * 3, int(total_fg * 0.012), 96)
+    keep_small_threshold = max(min_area * 5, int(total_fg * 0.025), 220)
+    attach_distance = min(36, max(18, int(min(image_width, image_height) * 0.018)))
+
+    large: list[_Component] = []
+    small: list[_Component] = []
+    kept_independent_small: list[_Component] = []
+    attached = 0
+    dropped = 0
+
+    for comp in components:
+        short_side = min(comp.box.width, comp.box.height)
+        if comp.area < small_area_threshold or short_side < 14:
+            small.append(comp)
+        else:
+            large.append(comp)
+
+    output = np.zeros_like(mask, dtype=bool)
+    parent_masks: list[np.ndarray] = [comp.mask.copy() for comp in large]
+
+    for comp in small:
+        parent_idx = _nearest_large_parent(comp, large, attach_distance)
+        if parent_idx is not None:
+            parent_masks[parent_idx] |= comp.mask
+            attached += 1
+            continue
+        if _keep_independent_small(comp, keep_small_threshold):
+            kept_independent_small.append(comp)
+            continue
+        dropped += 1
+
+    for parent_mask in parent_masks:
+        output |= parent_mask
+    for comp in kept_independent_small:
+        output |= comp.mask
+
+    return output.astype(bool), {
+        "safe_components_total_before_merge": len(components),
+        "safe_large_components": len(large),
+        "safe_small_islands": len(small),
+        "safe_small_islands_attached": attached,
+        "safe_small_islands_dropped": dropped,
+        "safe_small_islands_kept_independent": len(kept_independent_small),
+        "safe_small_area_threshold": int(small_area_threshold),
+        "safe_small_keep_threshold": int(keep_small_threshold),
+        "safe_attach_distance": int(attach_distance),
+    }
+
+
+def _components_from_mask(mask: np.ndarray) -> list[_Component]:
+    binary = mask.astype(np.uint8)
+    num_labels, labels, stats, _centroids = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    comps: list[_Component] = []
+    for label in range(1, num_labels):
+        area = int(stats[label, cv2.CC_STAT_AREA])
+        if area <= 0:
+            continue
+        left = int(stats[label, cv2.CC_STAT_LEFT])
+        top = int(stats[label, cv2.CC_STAT_TOP])
+        width = int(stats[label, cv2.CC_STAT_WIDTH])
+        height = int(stats[label, cv2.CC_STAT_HEIGHT])
+        box = BBox(left, top, left + width, top + height)
+        comps.append(_Component(label=label, box=box, area=area, mask=(labels == label)))
+    return comps
+
+
+def _nearest_large_parent(comp: _Component, parents: list[_Component], attach_distance: int) -> int | None:
+    best_idx: int | None = None
+    best_gap = attach_distance + 1
+    for idx, parent in enumerate(parents):
+        gap = _box_gap(comp.box, parent.box)
+        expanded = parent.box.padded(attach_distance, 10**9, 10**9)
+        center_inside = _center_inside(comp.box, expanded)
+        near = gap <= attach_distance or center_inside
+        if not near:
+            continue
+        if _is_likely_separate_object(comp, parent, gap, attach_distance):
+            continue
+        if gap < best_gap:
+            best_gap = gap
+            best_idx = idx
+    return best_idx
+
+
+def _is_likely_separate_object(comp: _Component, parent: _Component, gap: int, attach_distance: int) -> bool:
+    short_side = min(comp.box.width, comp.box.height)
+    if comp.area >= parent.area * 0.32 and gap > attach_distance * 0.45:
+        return True
+    if comp.area >= 420 and short_side >= 18 and gap > attach_distance * 0.70:
+        return True
+    return False
+
+
+def _keep_independent_small(comp: _Component, keep_small_threshold: int) -> bool:
+    short_side = min(comp.box.width, comp.box.height)
+    long_side = max(comp.box.width, comp.box.height)
+    if comp.area >= keep_small_threshold and short_side >= 18:
+        return True
+    if comp.area >= keep_small_threshold * 0.75 and short_side >= 16 and long_side >= 38:
+        return True
+    return False
+
+
+def _center_inside(box: BBox, parent: BBox) -> bool:
+    cx, cy = box.center
+    return parent.left <= cx <= parent.right and parent.top <= cy <= parent.bottom
+
+
 def _top_level_boxes(mask: np.ndarray, image_width: int, image_height: int, min_area: int) -> list[BBox]:
     min_pixels = max(min_area, int(image_width * image_height * 0.00018), 64)
     raw = components_bboxes(mask.astype(bool), min_area=min_pixels, min_size=5)
@@ -238,6 +360,12 @@ def _iou(a: BBox, b: BBox) -> float:
     inter = max(0, right - left) * max(0, bottom - top)
     union = max(1, a.area + b.area - inter)
     return float(inter / union)
+
+
+def _box_gap(a: BBox, b: BBox) -> int:
+    dx = max(0, max(a.left, b.left) - min(a.right, b.right))
+    dy = max(0, max(a.top, b.top) - min(a.bottom, b.bottom))
+    return max(dx, dy)
 
 
 def _save_mask(mask: np.ndarray, path: Path) -> None:
