@@ -25,18 +25,54 @@ DEFAULT_CONFIG = {
         "continue_on_error": True,
         "recursive": True,
         "head": {
-            "mode": "mediapipe",  # off, mediapipe, bisenet
+            "mode": "mediapipe",
             "debug": False,
         },
     },
-    "sheet": {"views": 4, "padding": 24, "min_area": 1000, "merge_distance": 24, "normalize_size": None, "threshold": 28.0, "debug": True, "retry_on_fail": True, "continue_on_error": True},
-    "items": {"padding": 16, "min_area": 120, "merge_distance": 12, "square_canvas": False, "normalize_size": None, "transparent_bg": False, "threshold": 28.0, "debug": True, "retry_on_fail": True, "min_count": 1, "continue_on_error": True},
+    "sheet": {
+        "recursive": True,
+        "views": 4,
+        "padding": 24,
+        "min_area": 1000,
+        "merge_distance": 24,
+        "normalize_size": None,
+        "threshold": 28.0,
+        "debug": True,
+        "retry_on_fail": True,
+        "continue_on_error": True,
+    },
+    "items": {
+        "recursive": True,
+        "padding": 16,
+        "min_area": 120,
+        "merge_distance": 12,
+        "square_canvas": False,
+        "normalize_size": None,
+        "transparent_bg": False,
+        "threshold": 28.0,
+        "debug": True,
+        "retry_on_fail": True,
+        "min_count": 1,
+        "continue_on_error": True,
+    },
 }
 
 PROFILES = {
-    "fast": {"bg": {"retry_on_fail": False, "head": {"mode": "off", "debug": False}}, "sheet": {"debug": False, "retry_on_fail": False}, "items": {"debug": False, "retry_on_fail": False}},
-    "balanced": {"bg": {"retry_on_fail": True, "head": {"mode": "mediapipe", "debug": False}}, "sheet": {"debug": True, "retry_on_fail": True}, "items": {"debug": True, "retry_on_fail": True}},
-    "high_quality": {"bg": {"retry_on_fail": True, "alpha_matting": True, "head": {"mode": "bisenet", "debug": True}}, "sheet": {"debug": True, "retry_on_fail": True}, "items": {"debug": True, "retry_on_fail": True}},
+    "fast": {
+        "bg": {"retry_on_fail": False, "head": {"mode": "off", "debug": False}},
+        "sheet": {"debug": False, "retry_on_fail": False},
+        "items": {"debug": False, "retry_on_fail": False},
+    },
+    "balanced": {
+        "bg": {"retry_on_fail": True, "head": {"mode": "mediapipe", "debug": False}},
+        "sheet": {"debug": True, "retry_on_fail": True},
+        "items": {"debug": True, "retry_on_fail": True},
+    },
+    "high_quality": {
+        "bg": {"retry_on_fail": True, "alpha_matting": True, "head": {"mode": "bisenet", "debug": True}},
+        "sheet": {"debug": True, "retry_on_fail": True},
+        "items": {"debug": True, "retry_on_fail": True},
+    },
 }
 
 
@@ -78,6 +114,29 @@ def _config_path() -> Path:
     return _ensure_workspace() / "config.json"
 
 
+def _normalize_config(config: dict) -> dict:
+    config.setdefault("bg", {})
+    config.setdefault("sheet", {})
+    config.setdefault("items", {})
+
+    _deep_update(config, {})
+    config["bg"].setdefault("backend", "auto")
+    config["bg"].setdefault("model", None)
+    config["bg"].setdefault("alpha_matting", False)
+    config["bg"].setdefault("retry_on_fail", True)
+    config["bg"].setdefault("continue_on_error", True)
+    config["bg"].setdefault("recursive", True)
+    config["bg"].setdefault("head", {"mode": "mediapipe", "debug": False})
+    config["bg"]["head"].setdefault("mode", "mediapipe")
+    config["bg"]["head"].setdefault("debug", False)
+
+    for key, value in DEFAULT_CONFIG["sheet"].items():
+        config["sheet"].setdefault(key, value)
+    for key, value in DEFAULT_CONFIG["items"].items():
+        config["items"].setdefault(key, value)
+    return config
+
+
 def _load_config() -> dict:
     config = json.loads(json.dumps(DEFAULT_CONFIG))
     path = _config_path()
@@ -86,11 +145,11 @@ def _load_config() -> dict:
             _deep_update(config, json.loads(path.read_text(encoding="utf-8")))
         except Exception:
             typer.echo(f"[WARN] Failed to read config: {path}. Using defaults.")
-    config.setdefault("bg", {}).setdefault("head", {"mode": "mediapipe", "debug": False})
-    return config
+    return _normalize_config(config)
 
 
 def _save_config(config: dict) -> None:
+    config = _normalize_config(config)
     _config_path().write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
     typer.echo(f"Saved config: {_config_path()}")
 
@@ -98,7 +157,7 @@ def _save_config(config: dict) -> None:
 def _apply_profile(config: dict, profile: str) -> dict:
     config["profile"] = profile
     _deep_update(config, PROFILES[profile])
-    return config
+    return _normalize_config(config)
 
 
 def _choose(title: str, options: list[tuple[str, str]]) -> str:
@@ -175,8 +234,8 @@ def _show_config(config: dict) -> None:
     typer.echo(f"  BG retry    : {config['bg']['retry_on_fail']}")
     typer.echo(f"  BG head     : mode={head.get('mode')} debug={head.get('debug')}")
     typer.echo(f"  BiSeNet ONNX: {_bisenet_model_path()} ({'installed' if _bisenet_model_available() else 'missing'})")
-    typer.echo(f"  Sheet retry : {config['sheet']['retry_on_fail']} / views={config['sheet']['views']}")
-    typer.echo(f"  Items retry : {config['items']['retry_on_fail']}")
+    typer.echo(f"  Sheet retry : {config['sheet']['retry_on_fail']} / views={config['sheet']['views']} / recursive={config['sheet']['recursive']}")
+    typer.echo(f"  Items retry : {config['items']['retry_on_fail']} / recursive={config['items']['recursive']}")
 
 
 def _head_settings_menu(config: dict) -> dict:
@@ -209,7 +268,7 @@ def _head_settings_menu(config: dict) -> dict:
             head["debug"] = not bool(head.get("debug", False))
             _save_config(config)
         else:
-            return config
+            return _normalize_config(config)
 
 
 def _config_menu(config: dict) -> dict:
@@ -226,7 +285,7 @@ def _config_menu(config: dict) -> dict:
             config = json.loads(json.dumps(DEFAULT_CONFIG))
             _save_config(config)
         else:
-            return config
+            return _normalize_config(config)
 
 
 def _show_task_help(task: str, title: str) -> tuple[Path, list[Path]]:
@@ -249,21 +308,7 @@ def _quick_bg(config: dict) -> None:
         return
     opts = config["bg"]
     head_refine, bisenet_onnx, head_debug = _head_runtime_options(config)
-    batch_remove_cmd(
-        input_dir,
-        None,
-        _workspace_root(),
-        opts["recursive"],
-        None,
-        opts["backend"],
-        opts.get("model"),
-        opts["alpha_matting"],
-        opts["retry_on_fail"],
-        head_refine,
-        bisenet_onnx,
-        head_debug,
-        opts["continue_on_error"],
-    )
+    batch_remove_cmd(input_dir, None, _workspace_root(), opts.get("recursive", True), None, opts["backend"], opts.get("model"), opts["alpha_matting"], opts["retry_on_fail"], head_refine, bisenet_onnx, head_debug, opts["continue_on_error"])
 
 
 def _quick_sheet(config: dict) -> None:
@@ -271,7 +316,7 @@ def _quick_sheet(config: dict) -> None:
     if not pending:
         return
     opts = config["sheet"]
-    batch_split_cmd(input_dir, None, _workspace_root(), opts["recursive"], None, opts["views"], opts["padding"], opts["min_area"], opts["merge_distance"], opts.get("normalize_size"), opts["threshold"], opts["debug"], opts["retry_on_fail"], opts["continue_on_error"])
+    batch_split_cmd(input_dir, None, _workspace_root(), opts.get("recursive", True), None, opts["views"], opts["padding"], opts["min_area"], opts["merge_distance"], opts.get("normalize_size"), opts["threshold"], opts["debug"], opts["retry_on_fail"], opts["continue_on_error"])
 
 
 def _quick_items(config: dict) -> None:
@@ -279,7 +324,7 @@ def _quick_items(config: dict) -> None:
     if not pending:
         return
     opts = config["items"]
-    batch_extract_cmd(input_dir, None, _workspace_root(), opts["recursive"], None, opts["padding"], opts["min_area"], opts["merge_distance"], opts["square_canvas"], opts.get("normalize_size"), opts["transparent_bg"], opts["threshold"], opts["debug"], opts["retry_on_fail"], opts["min_count"], opts["continue_on_error"])
+    batch_extract_cmd(input_dir, None, _workspace_root(), opts.get("recursive", True), None, opts["padding"], opts["min_area"], opts["merge_distance"], opts["square_canvas"], opts.get("normalize_size"), opts["transparent_bg"], opts["threshold"], opts["debug"], opts["retry_on_fail"], opts["min_count"], opts["continue_on_error"])
 
 
 def _quick_menu(config: dict) -> None:
