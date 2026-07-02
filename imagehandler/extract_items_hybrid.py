@@ -24,11 +24,8 @@ from .extract_items_plus import (
 from .fallback import remove_background_with_fallback
 from .io import ensure_output_dir, load_image
 from .mask_ops import (
-    apply_mask_as_alpha,
     clean_mask,
     components_bboxes,
-    crop_mask,
-    crop_with_padding,
     foreground_mask_from_background,
     normalize_size,
     pil_to_rgba_array,
@@ -110,6 +107,9 @@ def extract_items(
     split_count += final_splits
     boxes = sort_boxes_reading_order(_dedupe_boxes(boxes))
 
+    item_masks = _assign_instance_masks(support_mask, boxes, width, height)
+    mask_stats = _instance_mask_stats(support_mask, boxes, item_masks)
+
     coverage = _coverage_metrics(support_mask, boxes)
     warnings: list[str] = []
     if not boxes:
@@ -122,14 +122,14 @@ def extract_items(
         warnings.append("High item duplication; extracted crops overlap heavily.")
 
     outputs: list[str] = []
-    for idx, box in enumerate(boxes, start=1):
-        crop = crop_with_padding(image, box, padding=padding)
-        if transparent_bg:
-            local_mask = crop_mask(support_mask, box, padding=padding)
-            if local_mask.shape[1] == crop.width and local_mask.shape[0] == crop.height:
-                crop = apply_mask_as_alpha(crop, local_mask)
-            else:
-                crop = crop.convert("RGBA")
+    for idx, (box, item_mask) in enumerate(zip(boxes, item_masks, strict=True), start=1):
+        crop = _crop_with_instance_mask(
+            image=image,
+            box=box,
+            item_mask=item_mask,
+            padding=padding,
+            transparent_bg=transparent_bg,
+        )
         if square_canvas:
             crop = to_square_canvas(crop)
         if normalize:
@@ -142,7 +142,7 @@ def extract_items(
         ok=len(warnings) == 0,
         operation="extract-items",
         source=str(source),
-        mode="hybrid-alpha-support-rgb-core-final-refine",
+        mode="hybrid-alpha-support-rgb-core-final-refine-instance-mask-crop",
         warnings=warnings,
         metrics={
             "items": len(boxes),
@@ -155,6 +155,9 @@ def extract_items(
             "recursive_splits": split_count,
             "coverage_recovered_components": recovery_count,
             "pruned_parent_boxes": pruned_parent_boxes,
+            "instance_mask_assigned_pixels": mask_stats["assigned_pixels"],
+            "instance_mask_unassigned_pixels": mask_stats["unassigned_pixels"],
+            "instance_mask_empty_items": mask_stats["empty_items"],
             "image_width": width,
             "image_height": height,
             "min_area": min_area,
@@ -178,6 +181,7 @@ def extract_items(
             save_boxes_overlay(image, sam_boxes, out_dir / "debug_sam_boxes.png")
         save_boxes_overlay(image, boxes, out_dir / "debug_boxes.png")
         _save_coverage_debug(support_mask, boxes, out_dir / "debug_coverage_mask.png")
+        _save_instance_debug(item_masks, out_dir / "debug_instance_assignment.png")
 
     return report
 
@@ -276,6 +280,88 @@ def _make_hybrid_seed_mask(core_mask: np.ndarray, support_mask: np.ndarray, imag
     seed = cv2.erode(seed, kernel, iterations=1)
     seed = cv2.dilate(seed, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)), iterations=1)
     return (seed.astype(bool) & support_mask.astype(bool))
+
+
+def _assign_instance_masks(mask: np.ndarray, boxes: list[BBox], image_width: int, image_height: int) -> list[np.ndarray]:
+    """Assign foreground pixels to item boxes, favoring small/specific boxes.
+
+    Each foreground pixel is assigned at most once. Smaller boxes claim pixels first;
+    large parent boxes then receive only remaining foreground pixels. This preserves
+    major parent crops while reducing contamination from nearby child items.
+    """
+    labels = np.full((image_height, image_width), -1, dtype=np.int32)
+    order = sorted(range(len(boxes)), key=lambda idx: (boxes[idx].area, boxes[idx].top, boxes[idx].left))
+    for idx in order:
+        box = boxes[idx]
+        local_fg = mask[box.top : box.bottom, box.left : box.right].astype(bool)
+        if not local_fg.any():
+            continue
+        local_labels = labels[box.top : box.bottom, box.left : box.right]
+        claim = local_fg & (local_labels < 0)
+        local_labels[claim] = idx
+
+    item_masks: list[np.ndarray] = []
+    for idx, box in enumerate(boxes):
+        item_mask = labels == idx
+        if int(item_mask.sum()) == 0:
+            fallback = np.zeros_like(mask, dtype=bool)
+            fallback[box.top : box.bottom, box.left : box.right] = mask[box.top : box.bottom, box.left : box.right]
+            item_mask = fallback
+        item_masks.append(item_mask)
+    return item_masks
+
+
+def _crop_with_instance_mask(
+    image: Image.Image,
+    box: BBox,
+    item_mask: np.ndarray,
+    padding: int,
+    transparent_bg: bool,
+) -> Image.Image:
+    width, height = image.size
+    padded = box.padded(padding, width, height)
+    rgba = np.asarray(image.convert("RGBA")).copy()
+    local = rgba[padded.top : padded.bottom, padded.left : padded.right].copy()
+    local_mask = item_mask[padded.top : padded.bottom, padded.left : padded.right].astype(bool)
+    if local_mask.shape[:2] != local.shape[:2]:
+        return image.crop((padded.left, padded.top, padded.right, padded.bottom)).convert("RGBA")
+
+    if transparent_bg:
+        local[:, :, 3] = np.where(local_mask, local[:, :, 3], 0).astype(np.uint8)
+    else:
+        local[~local_mask, 0] = 255
+        local[~local_mask, 1] = 255
+        local[~local_mask, 2] = 255
+        local[~local_mask, 3] = 255
+    return Image.fromarray(local, mode="RGBA")
+
+
+def _instance_mask_stats(mask: np.ndarray, boxes: list[BBox], item_masks: list[np.ndarray]) -> dict[str, int]:
+    assigned = np.zeros_like(mask, dtype=bool)
+    empty = 0
+    for item_mask in item_masks:
+        pixels = int(item_mask.sum())
+        if pixels == 0:
+            empty += 1
+        assigned |= item_mask.astype(bool)
+    support_pixels = int(mask.sum())
+    assigned_pixels = int((assigned & mask).sum())
+    return {
+        "assigned_pixels": assigned_pixels,
+        "unassigned_pixels": max(0, support_pixels - assigned_pixels),
+        "empty_items": empty,
+    }
+
+
+def _save_instance_debug(item_masks: list[np.ndarray], path: Path) -> None:
+    if not item_masks:
+        return
+    height, width = item_masks[0].shape
+    preview = np.zeros((height, width), dtype=np.uint8)
+    for idx, item_mask in enumerate(item_masks, start=1):
+        value = 32 + ((idx * 37) % 223)
+        preview[item_mask.astype(bool)] = value
+    Image.fromarray(preview, mode="L").save(path)
 
 
 def _final_refine_after_recovery(
