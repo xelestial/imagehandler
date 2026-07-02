@@ -83,7 +83,24 @@ class OperationReport:
         return data
 
     def save(self, path: str | Path) -> None:
-        Path(path).write_text(
+        path = Path(path)
+        if (
+            self.operation == "extract-items"
+            and path.name == "manifest.json"
+            and self.outputs
+            and self.metrics.get("postprocess_mode") != "duplicate-partial-suppression"
+        ):
+            try:
+                from .item_postprocess import suppress_duplicate_partial_outputs
+
+                min_area = int(self.metrics.get("min_area", 120))
+                suppress_duplicate_partial_outputs(self, min_area=min_area)
+            except Exception as exc:
+                self.metrics["postprocess_error"] = str(exc)
+                self.warnings.append(f"Item postprocess failed: {exc}")
+                self.ok = False
+
+        path.write_text(
             json.dumps(self.to_dict(), ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
